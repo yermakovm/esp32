@@ -1,0 +1,14 @@
+CompileFlags:
+  Remove: [
+    "-fno-tree-switch-conversion",
+    "-mlongcalls",
+    "-mtext-section-literals",
+    "-fstrict-volatile-bitfields"
+]
+  Add: [
+    "-I~/.platformio/packages/framework-arduinoespressif32/cores/esp32",
+    "-I~/.platformio/packages/framework-arduinoespressif32/variants/esp32",
+    "-I~/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include",
+    "-I~/.platformio/packages/framework-arduinoespressif32/tools/sdk/include",
+    "-DARDUINO=10805"
+  ]
