@@ -1,3 +1,5 @@
 .pio
 # these cotain user-specific paths
 compile_commands.json
+.ccls
+.ccls-cache/
