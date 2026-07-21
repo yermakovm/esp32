@@ -1,0 +1,24 @@
+#include <Arduino.h>
+
+#define BTN_PIN 5
+static int btnPressCounter = 0;
+static bool btnPressed = false;
+
+void handleButtonPress() { btnPressed = true; }
+
+void setup() {
+
+  Serial.begin(115200);
+  attachInterrupt(digitalPinToInterrupt(BTN_PIN), handleButtonPress, FALLING);
+}
+
+void loop() {
+
+  if (!btnPressed) {
+    return;
+  }
+
+  btnPressCounter++;
+  btnPressed = false;
+  Serial.println(btnPressCounter);
+}

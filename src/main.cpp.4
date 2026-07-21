@@ -1,0 +1,69 @@
+#include "esp32-hal-gpio.h"
+#include <Arduino.h>
+
+#define BTN_PIN 5
+static int btnPressCounter = 0;
+static int lastPressedTime = 0;
+static int debounceDelay = 50;
+static int heldThreshold = 100;
+
+enum ButtonState {
+  BUTTON_RELEASED = 0,
+  BUTTON_PRESSED = 1,
+  BUTTON_HELD = 2,
+  BUTTON_IDLE = 3
+};
+
+ButtonState buttonState = BUTTON_RELEASED;
+
+void setup() {
+
+  Serial.begin(115200);
+  pinMode(BTN_PIN, INPUT_PULLDOWN);
+}
+
+void loop() {
+
+  int currentTime = millis();
+  int btnPinHigh = digitalRead(BTN_PIN) == HIGH;
+  switch (buttonState) {
+
+  case BUTTON_HELD:
+    // short press
+    if (!btnPinHigh) {
+      btnPressCounter++;
+      Serial.printf("Button pressed: %d\n", btnPressCounter);
+      buttonState = BUTTON_RELEASED;
+    }
+    break;
+
+  case BUTTON_PRESSED:
+    if (!btnPinHigh) {
+      buttonState = BUTTON_RELEASED;
+      break;
+    }
+
+    if (currentTime - lastPressedTime >= debounceDelay) {
+      buttonState = BUTTON_HELD;
+    }
+
+    break;
+
+  case BUTTON_RELEASED:
+    if (currentTime - lastPressedTime >= debounceDelay) {
+      buttonState = BUTTON_IDLE;
+    }
+    // Serial.println("Button released");
+    break;
+
+  case BUTTON_IDLE:
+    if (btnPinHigh) {
+      buttonState = BUTTON_PRESSED;
+      lastPressedTime = currentTime;
+    }
+    break;
+
+  default:
+    break;
+  }
+}

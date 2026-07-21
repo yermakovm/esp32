@@ -2,8 +2,13 @@
 
 #define BTN_PIN 5
 static int btnPressCounter = 0;
+static int lastBtnPressTime = 0;
 
 void handleButtonPress() {
+  if (millis() - lastBtnPressTime < 200) {
+    return;
+  }
+  lastBtnPressTime = millis();
   btnPressCounter++;
   Serial.println(btnPressCounter);
 }
