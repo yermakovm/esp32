@@ -1,0 +1,6 @@
+#define WAKE_UP_INTERVAL_S 6
+//#define WAKE_UP_INTERVAL_S 3600
+#define WORK_INTERVAL_S 3
+//#define WORK_INTERVAL_S (60 * 15)
+
+#define MOTOR_PIN 5
