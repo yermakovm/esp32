@@ -1,6 +1,4 @@
-.pio
-# these cotain user-specific paths
-compile_commands.json
-.ccls-cache/*
-.cache/*
-.clangd
+build/**
+.cache
+sdkconfig
+sdkconfig.old
