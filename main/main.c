@@ -17,18 +17,16 @@
 #define SAMPLES_PER_PRINT 5              // average N samples -> print every N*READ_MS
 
 /* Full-scale voltage at the pin for the configured attenuation.
- * ADC_ATTEN_DB_6 saturates at ~1750 mV (NOT the 3.3 V rail!).
+ * Datasheet suggests ~1750 mV for ADC_ATTEN_DB_6, but the empirical
+ * count-to-voltage span on the S3 measures closer to ~1840 mV.
  * Used only by the naive manual estimate; calibration knows better. */
-#define ADC_FS_MV       1750
-#define VREF_MV         3300             // 3.3V reference
+#define ADC_FS_MV       1840
 
 /* External voltage divider on the ADC input:
  * pot wiper --[10k]-- ADC pin --[10k]-- GND
  * Scales 0–3.3V down to 0–1.65V (inside the accurate 6 dB range).
- * Multiply readings back up by DIV_RATIO. */
-#define DIV_R_TOP       10000.0f         // wiper -> ADC pin
-#define DIV_R_BOT       10000.0f         // ADC pin -> GND
-#define DIV_RATIO       ((DIV_R_TOP + DIV_R_BOT) / DIV_R_BOT)  /* = 2.0 */
+ * NOTE: reported voltages are AT THE PIN, i.e. after division.
+ * No software compensation for the divider is applied. */
 
 /* ADC bit width — ESP32-S3 supports 12-bit */
 #define ADC_BITWIDTH    12
@@ -126,14 +124,14 @@ static void adc_read_task(void *arg)
         r.raw = raw_sum / SAMPLES_PER_PRINT;
 
         /* Manual voltage: naive linear estimate from the attenuation's
-         * full-scale, corrected for external divider */
-        r.manual_mv = raw_to_voltage_mv(r.raw, ADC_FS_MV, ADC_BITWIDTH) * DIV_RATIO;
+         * full-scale — this IS the pin voltage, no divider compensation */
+        r.manual_mv = raw_to_voltage_mv(r.raw, ADC_FS_MV, ADC_BITWIDTH);
 
         /* Calibrated voltage: curve-fitting, already in mV, corrected too */
         if (use_calib) {
             int mv;
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali, r.raw, &mv));
-            r.calibrated_mv = mv * DIV_RATIO;
+            r.calibrated_mv = mv;
         } else {
             r.calibrated_mv = r.manual_mv;
         }
@@ -158,8 +156,7 @@ void app_main(void)
     ESP_LOGI(TAG, "ADC Channel: CH9 (GPIO10)");
     ESP_LOGI(TAG, "ADC FS: %d mV @6dB  |  Bitwidth: %d  |  Sample: %d ms  |  Print: avg of %d (%d ms)",
              ADC_FS_MV, ADC_BITWIDTH, READ_MS, SAMPLES_PER_PRINT, READ_MS * SAMPLES_PER_PRINT);
-    ESP_LOGI(TAG, "Divider: %.0fk/%.0fk (x%.4f)",
-             DIV_R_TOP / 1000.0f, DIV_R_BOT / 1000.0f, DIV_RATIO);
+    ESP_LOGI(TAG, "Reporting: pin voltage (10k/10k divider NOT compensated)");
 
     xTaskCreate(adc_read_task, "adc_read", 4096, NULL, 5, NULL);
 }
