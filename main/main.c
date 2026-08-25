@@ -1,110 +1,165 @@
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
 #include "esp_adc/adc_oneshot.h"
-#include "driver/gpio.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_log.h"
 
-static const char *TAG = "PhotoRelay";
+/* ============================================================
+ * CONFIGURATION
+ * ============================================================ */
+#define ADC_CHANNEL     ADC_CHANNEL_9   // GPIO10 on ADC_UNIT_1
 
-// Photoresistor on GPIO5 -> ADC1_CHANNEL4 on ESP32-S3
-#define LDR_ADC_UNIT      ADC_UNIT_1
-#define LDR_ADC_CHANNEL   ADC_CHANNEL_4
-#define LDR_ATTEN         ADC_ATTEN_DB_11   // full 0V..3.3V range, 0..4095
+#define READ_MS         100              // sample interval
+#define SAMPLES_PER_PRINT 5              // average N samples -> print every N*READ_MS
 
-// Relay (via transistor) on GPIO10
-#define RELAY_GPIO        GPIO_NUM_10
+/* Full-scale voltage at the pin for the configured attenuation.
+ * ADC_ATTEN_DB_6 saturates at ~1750 mV (NOT the 3.3 V rail!).
+ * Used only by the naive manual estimate; calibration knows better. */
+#define ADC_FS_MV       1750
+#define VREF_MV         3300             // 3.3V reference
 
-#define CALIB_SAMPLES     32      // median of these = median light level at boot
-#define CALIB_PERIOD_MS   20      // sample spacing during calibration
-#define SAMPLE_PERIOD_MS  50      // steady-state sample spacing
+/* External voltage divider on the ADC input:
+ * pot wiper --[10k]-- ADC pin --[10k]-- GND
+ * Scales 0–3.3V down to 0–1.65V (inside the accurate 6 dB range).
+ * Multiply readings back up by DIV_RATIO. */
+#define DIV_R_TOP       10000.0f         // wiper -> ADC pin
+#define DIV_R_BOT       10000.0f         // ADC pin -> GND
+#define DIV_RATIO       ((DIV_R_TOP + DIV_R_BOT) / DIV_R_BOT)  /* = 2.0 */
 
-#define ADC_RAW_MAX       4095
+/* ADC bit width — ESP32-S3 supports 12-bit */
+#define ADC_BITWIDTH    12
 
-static adc_oneshot_unit_handle_t adc_handle;
+static const char *TAG = "adc_single";
 
-// Simple insertion sort (fine for small N)
-static void sort16(const uint16_t *in, uint16_t *out, int n)
+/* ============================================================
+ * HELPER: raw → voltage (simple linear conversion)
+ * ============================================================ */
+static inline float raw_to_voltage_mv(int raw_val, int ref_mv, int bits)
 {
-    for (int i = 0; i < n; i++)
-        out[i] = in[i];
-    for (int i = 1; i < n; i++) {
-        uint16_t key = out[i];
-        int j = i - 1;
-        while (j >= 0 && out[j] > key) {
-            out[j + 1] = out[j];
-            j--;
+    return (raw_val * (float)ref_mv) / ((1 << bits) - 1);
+}
+
+/* ============================================================
+ * DATA STRUCTURE — one reading
+ * ============================================================ */
+typedef struct {
+    int   raw;              // raw ADC counts (0–4095)
+    float manual_mv;        // linear conversion from VREF
+    float calibrated_mv;    // ESP-IDF curve-fitting calibration
+    float error_pct;        // |calibrated − manual| / calibrated × 100
+} adc_reading_t;
+
+/* ============================================================
+ * PRINT HEADER
+ * ============================================================ */
+static void print_header(void)
+{
+    printf("\n");
+    printf("%-8s | %-14s | %-18s | %-9s\n",
+           "Raw", "V_manual(mV)", "V_calibrated(mV)", "Error(%)");
+    printf("---------|----------------|--------------------|----------\n");
+}
+
+/* ============================================================
+ * PRINT ONE ROW
+ * ============================================================ */
+static void print_row(const adc_reading_t *r)
+{
+    printf("%-8d | %-14.2f | %-18.2f | %+9.3f\n",
+           r->raw,
+           r->manual_mv,
+           r->calibrated_mv,
+           r->error_pct);
+}
+
+/* ============================================================
+ * TASK: read ADC1 (raw + calibrated)
+ * ============================================================ */
+static void adc_read_task(void *arg)
+{
+    /* --- Init ADC unit --- */
+    adc_oneshot_unit_handle_t adc_handle = NULL;
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
+
+    /* --- Config channel --- */
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH,
+        .atten = ADC_ATTEN_DB_6,    // 0–~1.75V usable (better accuracy than 12 dB)
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &chan_cfg));
+
+    /* --- Calibration handle --- */
+    adc_cali_handle_t cali = NULL;
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id = ADC_UNIT_1,
+        .atten = ADC_ATTEN_DB_6,
+        .bitwidth = ADC_BITWIDTH,
+    };
+    ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali));
+
+    /* --- Main loop: sample every READ_MS, print average of
+     * SAMPLES_PER_PRINT readings (every N*READ_MS ms) --- */
+    adc_reading_t r;
+    bool use_calib = (cali != NULL);
+
+    printf("\n*** ADC1 READING (avg of %d, %s) ***\n",
+           SAMPLES_PER_PRINT,
+           use_calib ? "raw + calibrated" : "calibration unavailable");
+    print_header();
+
+    while (1) {
+        /* Accumulate SAMPLES_PER_PRINT samples */
+        uint32_t raw_sum = 0;
+        for (int i = 0; i < SAMPLES_PER_PRINT; i++) {
+            int raw;
+            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw));
+            raw_sum += raw;
+            vTaskDelay(pdMS_TO_TICKS(READ_MS));
         }
-        out[j + 1] = key;
+        r.raw = raw_sum / SAMPLES_PER_PRINT;
+
+        /* Manual voltage: naive linear estimate from the attenuation's
+         * full-scale, corrected for external divider */
+        r.manual_mv = raw_to_voltage_mv(r.raw, ADC_FS_MV, ADC_BITWIDTH) * DIV_RATIO;
+
+        /* Calibrated voltage: curve-fitting, already in mV, corrected too */
+        if (use_calib) {
+            int mv;
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali, r.raw, &mv));
+            r.calibrated_mv = mv * DIV_RATIO;
+        } else {
+            r.calibrated_mv = r.manual_mv;
+        }
+
+        /* Relative error between the two estimates, as % of calibrated.
+         * Guard against division by zero at 0V. */
+        r.error_pct = (fabsf(r.calibrated_mv) > 1e-6f)
+            ? (r.calibrated_mv - r.manual_mv) / r.calibrated_mv * 100.0f
+            : 0.0f;
+
+        print_row(&r);
+        vTaskDelay(pdMS_TO_TICKS(READ_MS));
     }
 }
 
-// Take CALIB_SAMPLES readings and return the median as the reference level
-static uint32_t calibrate_median(void)
-{
-    static uint16_t samples[32];
-    static uint16_t sorted[32];
-
-    for (int i = 0; i < CALIB_SAMPLES; i++) {
-        int raw = 0;
-        if (adc_oneshot_read(adc_handle, LDR_ADC_CHANNEL, &raw) != ESP_OK || raw < 0)
-            raw = 0;
-        samples[i] = (uint16_t)raw;
-        vTaskDelay(pdMS_TO_TICKS(CALIB_PERIOD_MS));
-    }
-    sort16(samples, sorted, CALIB_SAMPLES);
-
-    int n = CALIB_SAMPLES;
-    uint32_t median = (n % 2) ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
-    ESP_LOGI(TAG, "Calibration median = %lu", (unsigned long)median);
-    return median;
-}
-
+/* ============================================================
+ * ENTRY POINT
+ * ============================================================ */
 void app_main(void)
 {
-    // --- ADC setup (12-bit) ---
-    const adc_oneshot_unit_init_cfg_t unit_cfg = {
-        .unit_id  = LDR_ADC_UNIT,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
+    ESP_LOGI(TAG, "ESP32-S3 Single ADC Potentiometer Reading");
+    ESP_LOGI(TAG, "ADC Channel: CH9 (GPIO10)");
+    ESP_LOGI(TAG, "ADC FS: %d mV @6dB  |  Bitwidth: %d  |  Sample: %d ms  |  Print: avg of %d (%d ms)",
+             ADC_FS_MV, ADC_BITWIDTH, READ_MS, SAMPLES_PER_PRINT, READ_MS * SAMPLES_PER_PRINT);
+    ESP_LOGI(TAG, "Divider: %.0fk/%.0fk (x%.4f)",
+             DIV_R_TOP / 1000.0f, DIV_R_BOT / 1000.0f, DIV_RATIO);
 
-    const adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten    = LDR_ATTEN,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, LDR_ADC_CHANNEL, &chan_cfg));
-
-    // --- Relay output setup ---
-    const gpio_config_t io_cfg = {
-        .pin_bit_mask = 1ULL << RELAY_GPIO,
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io_cfg));
-    gpio_set_level(RELAY_GPIO, 0);   // start with relay off
-
-    // --- Initial calibration: dynamic threshold = 2 x median ---
-    uint32_t median   = calibrate_median();
-    uint32_t threshold = median * 2;
-    if (threshold > ADC_RAW_MAX)
-        threshold = ADC_RAW_MAX;
-    ESP_LOGI(TAG, "Dynamic threshold = %lu", (unsigned long)threshold);
-
-    // --- Main loop ---
-    while (1) {
-        int raw = 0;
-        if (adc_oneshot_read(adc_handle, LDR_ADC_CHANNEL, &raw) == ESP_OK) {
-            if ((uint32_t)raw > threshold) {
-                gpio_set_level(RELAY_GPIO, 1);   // brighter than median x2: close relay
-            } else if ((uint32_t)raw < threshold) {
-                gpio_set_level(RELAY_GPIO, 0);   // darker: open relay
-            }
-            // raw == threshold: leave output unchanged
-            ESP_LOGI(TAG, "ADC GPIO5 = %d (threshold %lu)", raw, (unsigned long)threshold);
-        } else {
-            ESP_LOGW(TAG, "ADC read failed, retrying");
-        }
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
-    }
+    xTaskCreate(adc_read_task, "adc_read", 4096, NULL, 5, NULL);
 }
