@@ -1,148 +1,144 @@
 #include <stdio.h>
-#include <math.h>
 #include <stdint.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 
 /* ============================================================
  * CONFIGURATION
  * ============================================================ */
-#define ADC_CHANNEL     ADC_CHANNEL_9   // GPIO10 on ADC_UNIT_1
+#define ADC_CHANNEL     ADC_CHANNEL_9   // GPIO10 on ADC_UNIT_1 (unchanged from pot setup)
+#define LED_GPIO        GPIO_NUM_5      // LED on GPIO5, active-high
 
-#define READ_MS         100              // sample interval
-#define SAMPLES_PER_PRINT 5              // average N samples -> print every N*READ_MS
+#define READ_MS         100             // sample interval
+#define SMA_SIZE        10              // simple moving average window (samples)
+#define CALIB_SAMPLES   10              // init measurements -> baseline (== SMA_SIZE, primes the filter)
+#define HYST_STEP       200             // hysteresis band half-width (raw counts, baseline +/- 200)
+#define PRINT_EVERY     5               // status line cadence (x READ_MS)
 
-/* Full-scale voltage at the pin for the configured attenuation.
- * Datasheet suggests ~1750 mV for ADC_ATTEN_DB_6, but the empirical
- * count-to-voltage span on the S3 measures closer to ~1840 mV.
- * Used only by the naive manual estimate; calibration knows better. */
-#define ADC_FS_MV       1840
+#define ADC_BITWIDTH    12              // ESP32-S3 supports 12-bit
 
-/* External voltage divider on the ADC input:
- * pot wiper --[10k]-- ADC pin --[10k]-- GND
- * Scales 0–3.3V down to 0–1.65V (inside the accurate 6 dB range).
- * NOTE: reported voltages are AT THE PIN, i.e. after division.
- * No software compensation for the divider is applied. */
+/* LDR voltage divider at the ADC input (same 10k/10k divider as the old pot).
+ * Measured behavior on the bench:
+ *
+ *   bright -> HIGH raw counts (~3600)
+ *   dark   -> LOW  raw counts (~0)
+ *
+ * => DARK means a LOW reading, so the LED turns ON in the dark.
+ */
 
-/* ADC bit width — ESP32-S3 supports 12-bit */
-#define ADC_BITWIDTH    12
-
-static const char *TAG = "adc_single";
-
-/* ============================================================
- * HELPER: raw → voltage (simple linear conversion)
- * ============================================================ */
-static inline float raw_to_voltage_mv(int raw_val, int ref_mv, int bits)
-{
-    return (raw_val * (float)ref_mv) / ((1 << bits) - 1);
-}
+static const char *TAG = "ldr_led";
 
 /* ============================================================
- * DATA STRUCTURE — one reading
+ * SIMPLE MOVING AVERAGE (SMA) FILTER
+ * Circular buffer of the last SMA_SIZE samples; output is the
+ * mean of the window. Running-sum keeps each push O(1).
  * ============================================================ */
 typedef struct {
-    int   raw;              // raw ADC counts (0–4095)
-    float manual_mv;        // linear conversion from VREF
-    float calibrated_mv;    // ESP-IDF curve-fitting calibration
-    float error_pct;        // |calibrated − manual| / calibrated × 100
-} adc_reading_t;
+    int buf[SMA_SIZE];   // circular buffer
+    int idx;             // next slot to overwrite (oldest when full)
+    int count;           // filled samples (<= SMA_SIZE)
+    int sum;             // running sum of the window
+} sma_t;
 
-/* ============================================================
- * PRINT HEADER
- * ============================================================ */
-static void print_header(void)
+static void sma_init(sma_t *s)
 {
-    printf("\n");
-    printf("%-8s | %-14s | %-18s | %-9s\n",
-           "Raw", "V_manual(mV)", "V_calibrated(mV)", "Error(%)");
-    printf("---------|----------------|--------------------|----------\n");
+    memset(s, 0, sizeof(*s));
+}
+
+/* Push one sample, return the current mean of the window. */
+static int sma_push(sma_t *s, int sample)
+{
+    if (s->count < SMA_SIZE) {
+        s->buf[s->idx] = sample;
+        s->sum += sample;
+        s->count++;
+    } else {
+        s->sum -= s->buf[s->idx];   // drop oldest
+        s->buf[s->idx] = sample;
+        s->sum += sample;
+    }
+    s->idx = (s->idx + 1) % SMA_SIZE;
+    return s->sum / s->count;
 }
 
 /* ============================================================
- * PRINT ONE ROW
+ * LED
  * ============================================================ */
-static void print_row(const adc_reading_t *r)
+static void led_set(bool on)
 {
-    printf("%-8d | %-14.2f | %-18.2f | %+9.3f\n",
-           r->raw,
-           r->manual_mv,
-           r->calibrated_mv,
-           r->error_pct);
+    gpio_set_level(LED_GPIO, on ? 1 : 0);
 }
 
 /* ============================================================
- * TASK: read ADC1 (raw + calibrated)
+ * TASK: calibrate, then filter LDR + hysteresis-driven LED
  * ============================================================ */
-static void adc_read_task(void *arg)
+static void ldr_led_task(void *arg)
 {
-    /* --- Init ADC unit --- */
     adc_oneshot_unit_handle_t adc_handle = NULL;
     adc_oneshot_unit_init_cfg_t init_cfg = {
         .unit_id = ADC_UNIT_1,
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
 
-    /* --- Config channel --- */
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH,
-        .atten = ADC_ATTEN_DB_6,    // 0–~1.75V usable (better accuracy than 12 dB)
+        .atten = ADC_ATTEN_DB_6,   // 0–~1.75V usable (matches 10k/10k divider)
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &chan_cfg));
 
-    /* --- Calibration handle --- */
-    adc_cali_handle_t cali = NULL;
-    adc_cali_curve_fitting_config_t cali_cfg = {
-        .unit_id = ADC_UNIT_1,
-        .atten = ADC_ATTEN_DB_6,
-        .bitwidth = ADC_BITWIDTH,
-    };
-    ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali));
+    sma_t sma;
+    sma_init(&sma);
 
-    /* --- Main loop: sample every READ_MS, print average of
-     * SAMPLES_PER_PRINT readings (every N*READ_MS ms) --- */
-    adc_reading_t r;
-    bool use_calib = (cali != NULL);
+    int baseline = 0;
+    for (int i = 0; i < CALIB_SAMPLES; i++) {
+        int raw;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw));
+        baseline += raw;
+        sma_push(&sma, raw);
+        vTaskDelay(pdMS_TO_TICKS(READ_MS));
+    }
+    baseline /= CALIB_SAMPLES;
 
-    printf("\n*** ADC1 READING (avg of %d, %s) ***\n",
-           SAMPLES_PER_PRINT,
-           use_calib ? "raw + calibrated" : "calibration unavailable");
-    print_header();
+    const int max_raw = (1 << ADC_BITWIDTH) - 1;
+    int thr_dark  = baseline - HYST_STEP;
+    int thr_light = baseline + HYST_STEP;
+    if (thr_dark < 0)         thr_dark  = 0;
+    if (thr_light > max_raw)  thr_light = max_raw;
+
+     * If you calibrate in near-saturated light (raw ~3600),
+     * thr_light lands above the divider's max output and the LED
+     * can turn ON but never OFF again. */
+
+    ESP_LOGI(TAG, "calibrated: baseline=%d  dark_on<=%d  light_off>=%d",
+             baseline, thr_dark, thr_light);
+
+    bool led_on = false;
+    int loop = 0;
 
     while (1) {
-        /* Accumulate SAMPLES_PER_PRINT samples */
-        uint32_t raw_sum = 0;
-        for (int i = 0; i < SAMPLES_PER_PRINT; i++) {
-            int raw;
-            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw));
-            raw_sum += raw;
-            vTaskDelay(pdMS_TO_TICKS(READ_MS));
-        }
-        r.raw = raw_sum / SAMPLES_PER_PRINT;
+        int raw;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw));
+        int filtered = sma_push(&sma, raw);
 
-        /* Manual voltage: naive linear estimate from the attenuation's
-         * full-scale — this IS the pin voltage, no divider compensation */
-        r.manual_mv = raw_to_voltage_mv(r.raw, ADC_FS_MV, ADC_BITWIDTH);
-
-        /* Calibrated voltage: curve-fitting, already in mV, corrected too */
-        if (use_calib) {
-            int mv;
-            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(cali, r.raw, &mv));
-            r.calibrated_mv = mv;
-        } else {
-            r.calibrated_mv = r.manual_mv;
+        if (!led_on && filtered <= thr_dark) {
+            led_on = true;
+            led_set(true);
+            ESP_LOGI(TAG, "dark  (filtered=%d <= %d) -> LED ON", filtered, thr_dark);
+        } else if (led_on && filtered >= thr_light) {
+            led_on = false;
+            led_set(false);
+            ESP_LOGI(TAG, "light (filtered=%d >= %d) -> LED OFF", filtered, thr_light);
         }
 
-        /* Relative error between the two estimates, as % of calibrated.
-         * Guard against division by zero at 0V. */
-        r.error_pct = (fabsf(r.calibrated_mv) > 1e-6f)
-            ? (r.calibrated_mv - r.manual_mv) / r.calibrated_mv * 100.0f
-            : 0.0f;
+        if (++loop % PRINT_EVERY == 0) {
+            printf("raw=%-4d filtered=%-4d | dark_on<=%d light_off>=%d | LED=%s\n",
+                   raw, filtered, thr_dark, thr_light, led_on ? "ON " : "off");
+        }
 
-        print_row(&r);
         vTaskDelay(pdMS_TO_TICKS(READ_MS));
     }
 }
@@ -152,11 +148,21 @@ static void adc_read_task(void *arg)
  * ============================================================ */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 Single ADC Potentiometer Reading");
-    ESP_LOGI(TAG, "ADC Channel: CH9 (GPIO10)");
-    ESP_LOGI(TAG, "ADC FS: %d mV @6dB  |  Bitwidth: %d  |  Sample: %d ms  |  Print: avg of %d (%d ms)",
-             ADC_FS_MV, ADC_BITWIDTH, READ_MS, SAMPLES_PER_PRINT, READ_MS * SAMPLES_PER_PRINT);
-    ESP_LOGI(TAG, "Reporting: pin voltage (10k/10k divider NOT compensated)");
+    ESP_LOGI(TAG, "ESP32-S3 LDR light sensor -> LED");
+    ESP_LOGI(TAG, "ADC: CH9 (GPIO10), oneshot, %d-bit, 6dB", ADC_BITWIDTH);
+    ESP_LOGI(TAG, "LED: GPIO%d (on in dark)  SMA=%d  hysteresis=+/-%d",
+             LED_GPIO, SMA_SIZE, HYST_STEP);
 
-    xTaskCreate(adc_read_task, "adc_read", 4096, NULL, 5, NULL);
+    /* --- LED GPIO (output, active-high, start off) --- */
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << LED_GPIO,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    led_set(false);
+
+    xTaskCreate(ldr_led_task, "ldr_led", 4096, NULL, 5, NULL);
 }
