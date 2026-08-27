@@ -6,37 +6,31 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
+#define ADC_UNIT          ADC_UNIT_1
+#define ADC_CHANNEL       ADC_CHANNEL_9   // GPIO10 on ADC_UNIT_1
 
-/* ============================================================
- * CONFIGURATION
- * ============================================================ */
-#define ADC_CHANNEL     ADC_CHANNEL_9   // GPIO10 on ADC_UNIT_1 (unchanged from pot setup)
-#define LED_GPIO        GPIO_NUM_5      // LED on GPIO5, active-high
+#define LED_GPIO          GPIO_NUM_5      // LED, active-high, PWM
+#define MOTOR_GPIO        GPIO_NUM_4      // DC motor (via driver/MOSFET), PWM
 
-#define READ_MS         100             // sample interval
-#define SMA_SIZE        10              // simple moving average window (samples)
-#define CALIB_SAMPLES   10              // init measurements -> baseline (== SMA_SIZE, primes the filter)
-#define HYST_STEP       200             // hysteresis band half-width (raw counts, baseline +/- 200)
-#define PRINT_EVERY     5               // status line cadence (x READ_MS)
+#define PWM_TIMER         LEDC_TIMER_0
+#define PWM_MODE          LEDC_LOW_SPEED_MODE
+#define PWM_FREQ_HZ       (10000)         // 10 kHz: above most motor PWM drive ranges
+#define PWM_RES           LEDC_TIMER_12_BIT
+#define PWM_MAX_DUTY      ((1 << 12) - 1) // 4095
+#define LED_CHANNEL       LEDC_CHANNEL_0
+#define MOTOR_CHANNEL     LEDC_CHANNEL_1
 
-#define ADC_BITWIDTH    12              // ESP32-S3 supports 12-bit
+#define READ_MS           100             // update LED + motor every 100 ms
+#define SMA_SIZE          8               // moving average window (samples)
+#define ADC_BITWIDTH      12
+#define ADC_MIN_RAW       100             // pot endpoints: ignore the noisy edges
+#define ADC_MAX_RAW       3600            // ~1.65 V through the 10k/10k divider (DB_6)
+#define PWM_FLOOR_DUTY    700             // below this the motor only buzzes/stalls (set 0 to disable)
+#define PRINT_EVERY       5               // status line cadence (x READ_MS)
 
-/* LDR voltage divider at the ADC input (same 10k/10k divider as the old pot).
- * Measured behavior on the bench:
- *
- *   bright -> HIGH raw counts (~3600)
- *   dark   -> LOW  raw counts (~0)
- *
- * => DARK means a LOW reading, so the LED turns ON in the dark.
- */
+static const char *TAG = "pot_pwm";
 
-static const char *TAG = "ldr_led";
-
-/* ============================================================
- * SIMPLE MOVING AVERAGE (SMA) FILTER
- * Circular buffer of the last SMA_SIZE samples; output is the
- * mean of the window. Running-sum keeps each push O(1).
- * ============================================================ */
 typedef struct {
     int buf[SMA_SIZE];   // circular buffer
     int idx;             // next slot to overwrite (oldest when full)
@@ -65,58 +59,90 @@ static int sma_push(sma_t *s, int sample)
     return s->sum / s->count;
 }
 
-/* ============================================================
- * LED
- * ============================================================ */
-static void led_set(bool on)
+static int clamp_i(int v, int lo, int hi)
 {
-    gpio_set_level(LED_GPIO, on ? 1 : 0);
+    return (v < lo) ? lo : (v > hi ? hi : v);
+}
+
+/* Map the pot's usable range (ADC_MIN_RAW..ADC_MAX_RAW) onto 0..PWM_MAX_DUTY. */
+static int duty_from_raw(int raw)
+{
+    int span = ADC_MAX_RAW - ADC_MIN_RAW;
+    int d = ((clamp_i(raw, ADC_MIN_RAW, ADC_MAX_RAW) - ADC_MIN_RAW) * PWM_MAX_DUTY) / span;
+    return clamp_i(d, 0, PWM_MAX_DUTY);
 }
 
 /* ============================================================
- * TASK: calibrate, then filter LDR + hysteresis-driven LED
+ * PWM: one timer, two channels, one shared duty value
  * ============================================================ */
-static void ldr_led_task(void *arg)
+static void pwm_init(void)
+{
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = PWM_MODE,
+        .timer_num       = PWM_TIMER,
+        .duty_resolution = PWM_RES,
+        .freq_hz         = PWM_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    const struct {
+        ledc_channel_t ch;
+        gpio_num_t     gpio;
+    } chans[] = {
+        { LED_CHANNEL,   LED_GPIO   },
+        { MOTOR_CHANNEL, MOTOR_GPIO },
+    };
+
+    for (size_t i = 0; i < sizeof(chans) / sizeof(chans[0]); i++) {
+        ledc_channel_config_t ch_cfg = {
+            .gpio_num   = chans[i].gpio,
+            .speed_mode = PWM_MODE,
+            .channel    = chans[i].ch,
+            .timer_sel  = PWM_TIMER,   // both channels share the timer -> same frequency
+            .duty       = 0,           // start off
+            .hpoint     = 0,
+        };
+        ESP_ERROR_CHECK(ledc_channel_config(&ch_cfg));
+    }
+}
+
+static void pwm_set_both(uint32_t duty)
+{
+    const ledc_channel_t chans[] = { LED_CHANNEL, MOTOR_CHANNEL };
+
+    for (size_t i = 0; i < sizeof(chans) / sizeof(chans[0]); i++) {
+        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, chans[i], duty));
+        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, chans[i]));
+    }
+}
+
+static void pot_pwm_task(void *arg)
 {
     adc_oneshot_unit_handle_t adc_handle = NULL;
     adc_oneshot_unit_init_cfg_t init_cfg = {
-        .unit_id = ADC_UNIT_1,
+        .unit_id = ADC_UNIT,
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
 
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH,
-        .atten = ADC_ATTEN_DB_6,   // 0–~1.75V usable (matches 10k/10k divider)
+.atten = ADC_ATTEN_DB_6,    // 10k/10k divider halves 0..3.3 V -> ~0..1.65 V (DB_6 range)
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &chan_cfg));
 
     sma_t sma;
     sma_init(&sma);
 
-    int baseline = 0;
-    for (int i = 0; i < CALIB_SAMPLES; i++) {
+    /* Prime the filter so the first loop iteration isn't a jump from 0. */
+    for (int i = 0; i < SMA_SIZE; i++) {
         int raw;
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw));
-        baseline += raw;
         sma_push(&sma, raw);
         vTaskDelay(pdMS_TO_TICKS(READ_MS));
     }
-    baseline /= CALIB_SAMPLES;
 
-    const int max_raw = (1 << ADC_BITWIDTH) - 1;
-    int thr_dark  = baseline - HYST_STEP;
-    int thr_light = baseline + HYST_STEP;
-    if (thr_dark < 0)         thr_dark  = 0;
-    if (thr_light > max_raw)  thr_light = max_raw;
-
-     * If you calibrate in near-saturated light (raw ~3600),
-     * thr_light lands above the divider's max output and the LED
-     * can turn ON but never OFF again. */
-
-    ESP_LOGI(TAG, "calibrated: baseline=%d  dark_on<=%d  light_off>=%d",
-             baseline, thr_dark, thr_light);
-
-    bool led_on = false;
+    uint32_t last_duty = 0;
     int loop = 0;
 
     while (1) {
@@ -124,45 +150,41 @@ static void ldr_led_task(void *arg)
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL, &raw));
         int filtered = sma_push(&sma, raw);
 
-        if (!led_on && filtered <= thr_dark) {
-            led_on = true;
-            led_set(true);
-            ESP_LOGI(TAG, "dark  (filtered=%d <= %d) -> LED ON", filtered, thr_dark);
-        } else if (led_on && filtered >= thr_light) {
-            led_on = false;
-            led_set(false);
-            ESP_LOGI(TAG, "light (filtered=%d >= %d) -> LED OFF", filtered, thr_light);
+        uint32_t duty = (uint32_t)duty_from_raw(filtered);
+        if (duty > 0 && duty < PWM_FLOOR_DUTY) {
+            duty = PWM_FLOOR_DUTY;
+        }
+
+        if (duty != last_duty) {
+            pwm_set_both(duty);
+            last_duty = duty;
         }
 
         if (++loop % PRINT_EVERY == 0) {
-            printf("raw=%-4d filtered=%-4d | dark_on<=%d light_off>=%d | LED=%s\n",
-                   raw, filtered, thr_dark, thr_light, led_on ? "ON " : "off");
+            printf("raw=%-4d filtered=%-4d | duty=%-4u/%-4d (%2u%%) -> LED GPIO%d + MOTOR GPIO%d\n",
+                   raw, filtered, (unsigned)duty, PWM_MAX_DUTY,
+                   (unsigned)(duty * 100 / PWM_MAX_DUTY), LED_GPIO, MOTOR_GPIO);
         }
 
         vTaskDelay(pdMS_TO_TICKS(READ_MS));
     }
 }
 
-/* ============================================================
- * ENTRY POINT
- * ============================================================ */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 LDR light sensor -> LED");
-    ESP_LOGI(TAG, "ADC: CH9 (GPIO10), oneshot, %d-bit, 6dB", ADC_BITWIDTH);
-    ESP_LOGI(TAG, "LED: GPIO%d (on in dark)  SMA=%d  hysteresis=+/-%d",
-             LED_GPIO, SMA_SIZE, HYST_STEP);
+    ESP_LOGI(TAG, "ESP32-S3 potentiometer -> LED + DC motor (PWM)");
+ESP_LOGI(TAG, "ADC: unit1 CH9 (GPIO10), oneshot, %d-bit, 6dB (10k/10k divider)", ADC_BITWIDTH);
+    ESP_LOGI(TAG, "PWM: %d Hz (10 kHz = above audible motor drive), 12-bit duty, "
+             "LED=GPIO%d ch%d, MOTOR=GPIO%d ch%d (share timer)",
+             PWM_FREQ_HZ, LED_GPIO, LED_CHANNEL, MOTOR_GPIO, MOTOR_CHANNEL);
+    ESP_LOGI(TAG, "loop=%d ms, SMA=%d, duty floor=%d/%d",
+             READ_MS, SMA_SIZE, PWM_FLOOR_DUTY, PWM_MAX_DUTY);
 
-    /* --- LED GPIO (output, active-high, start off) --- */
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << LED_GPIO,
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io));
-    led_set(false);
+    /* Start both outputs low before the PWM peripheral takes over the pins. */
+    gpio_reset_pin(LED_GPIO);
+    gpio_reset_pin(MOTOR_GPIO);
 
-    xTaskCreate(ldr_led_task, "ldr_led", 4096, NULL, 5, NULL);
+    pwm_init();
+
+    xTaskCreate(pot_pwm_task, "pot_pwm", 4096, NULL, 5, NULL);
 }
