@@ -1,32 +1,17 @@
 /**
- * ESP32-S3 <-> STM32F411 UART link (lesson)
+ * ESP32-S3 <-> STM32 UART link (lesson)
  *
- * Bidirectional "toggle the LED" demo over UART:
- *   - Button press on ESP32  -> sends TOGGLE frame -> STM32 flips its onboard LED
- *   - Valid frame from STM32 -> ESP32 flips its ONBOARD RGB LED
+ * Button press here -> TOGGLE frame -> STM32 flips its LED.
+ * Valid frame from STM32 -> flip our onboard WS2812.
  *
- * Physical wiring (both boards powered from USB, cross the TX/RX!):
- *   ESP32-S3 GPIO17 (UART1_TX)  --->  STM32 PA3 (USART2_RX)
- *   ESP32-S3 GPIO18 (UART1_RX)  <---  STM32 PA2 (USART2_TX)
- *   ESP32-S3 GND                -----  STM32 GND
- *   ESP32-S3 user button GPIO10 -> tact switch -> GND   (already wired on DevKitC-1)
+ * Wiring (cross TX/RX, common GND):
+ *   GPIO17 (UART1_TX) -> STM32 PA3 (USART2_RX)
+ *   GPIO18 (UART1_RX) <- STM32 PA2 (USART2_TX)
+ *   WS2812 data: GPIO48 (DevKitC-1 v1.0; v1.1 uses a solder jumper, else GPIO38)
+ *   Button: GPIO10 to GND, internal pull-up (wired on DevKitC-1)
  *
- * Onboard RGB LED:
- *   - ESP32-S3-DevKitC-1 (v1.0): WS2812 on GPIO48
- *   - ESP32-S3-DevKitC-1 (v1.1): solder jumper; otherwise GPIO38
- *   - Some boards have a simple LED there (just toggle the pin)
- *   The code below drives WS2812 protocol via GPIO bit-banging using
- *   cycle-accurate rom delays.
- *
- * Frame protocol (identical in both directions):
- *   byte0 = header 0xA5
- *   byte1 = command (CMD_TOGGLE_LEDS = 0x01)
- *   byte2 = header XOR command  (cheap checksum; wrong -> frame discarded)
- *   Baud: 115200 8N1
- *
- * NOTE on BOOT/RST buttons: not used here. RST/EN is a hardware reset pin.
- * ESP32-S3 GPIO0 ("BOOT") is a strapping pin: pressing it with RST drops into
- * download mode. We use the existing wired button on GPIO10 instead.
+ * Frame, both directions, 115200 8N1:
+ *   0xA5 | cmd (CMD_TOGGLE_LEDS) | header^cmd  (wrong checksum -> frame dropped)
  */
 
 #include <stdbool.h>
@@ -59,13 +44,11 @@ static const char *TAG = "uart_link";
 #define CMD_TOGGLE_LEDS    0x01U
 #define FRAME_LEN          3U
 
-/* ----- WS2812 / RGB LED timing (bit-banged via cycle counter) ----- */
-/* esp_rom_delay_us() has 1 µs resolution but WS2812 needs ~350/900 ns
- * edges — and the old code set bit0/bit1 timings identical, so every bit
- * looked the same to the LED. Instead we busy-wait on esp_cpu_get_cycle_count()
- * against absolute deadlines (overhead of the loop itself is absorbed).
- * The counter resolution is >= 40 MHz (>= 25 ns), calibrated at init.
- * WS2812-B spec: T1H≈900ns T1L≈350ns, T0H≈380ns T0L~>800ns, bit≈1.25µs. */
+/* WS2812 bit-banging via CPU cycle counter:
+ * esp_rom_delay_us() only has 1 us resolution, too coarse for WS2812 edges,
+ * so we busy-wait on esp_cpu_get_cycle_count() against absolute deadlines
+ * (loop overhead absorbed). Counter calibrated at init, >=40 MHz.
+ * WS2812-B: T1H~900ns T1L~350ns, T0H~380ns, bit ~1.25us. */
 #define WS2812_RESET_US       60U  /* >50µs reset */
 
 static uint32_t s_ticks_per_us;
@@ -104,14 +87,14 @@ static inline void ws2812_send_bit(uint32_t high_t)
     while ((uint32_t)(esp_cpu_get_cycle_count() - start) < s_bit_total_t) { }
 }
 
-/* Send 24-bit GRB color to WS2812 (GRB order, MSB first per channel). */
 static portMUX_TYPE s_led_mux = portMUX_INITIALIZER_UNLOCKED;
 
+/* Send 24-bit color, GRB order, MSB first per channel. */
 static void ws2812_send_color(uint8_t g, uint8_t r, uint8_t b)
 {
-    /* Spinlock + disabled interrupts: makes the whole ~30 µs frame atomic on
-     * both cores, so rx_task and status_task can never interleave bits and no
-     * ISR can stretch a bit past the WS2812 reset timeout mid-frame. */
+    /* Spinlock + IRQ off: keeps the whole ~30 us frame atomic on both cores, so
+     * tasks cannot interleave bits and no ISR can stretch a bit past the reset
+     * timeout mid-frame. */
     portENTER_CRITICAL(&s_led_mux);
     for (int i = 7; i >= 0; i--) ws2812_send_bit(((g >> i) & 1) ? s_bit1_high_t : s_bit0_high_t);
     for (int i = 7; i >= 0; i--) ws2812_send_bit(((r >> i) & 1) ? s_bit1_high_t : s_bit0_high_t);
@@ -121,8 +104,7 @@ static void ws2812_send_color(uint8_t g, uint8_t r, uint8_t b)
     portEXIT_CRITICAL(&s_led_mux);
 }
 
-/* LED states */
-static bool s_led_on = false;     /* "green" state (logical toggle from STM32) */
+static bool s_led_on = false;   /* logical on/off requested by the peer */
 
 static void ws2812_apply_state(void)
 {
@@ -140,8 +122,6 @@ static volatile bool s_activity_pulse = false;
 /* Button debounce */
 #define BUTTON_DEBOUNCE_MS 300
 static volatile uint32_t s_last_button_time = 0;
-
-/* --------------------------------------------------------- */
 
 static void uart_link_init(void)
 {
