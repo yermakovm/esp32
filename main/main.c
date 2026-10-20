@@ -1,131 +1,80 @@
 /**
- * ESP32-S3 <-> STM32 UART link (lesson)
+ * Lesson 4.6 — DMA: ADC1 continuous mode (GDMA) -> processing -> UART (ESP32-S3)
+ * Source practice: practice_dma_adc_uart_esp-idf.md (Parts 2, 3, 5, 6)
  *
- * Button press here -> TOGGLE frame -> STM32 flips its LED.
- * Valid frame from STM32 -> flip our onboard WS2812.
+ * Chain: ADC1 samples continuously into a ring of DMA frames (no CPU polling)
+ *        -> ISR wakes adc_read_task -> statistics (min/max/vpp/avg)
+ *        -> uart_write_bytes() on UART0 (interrupt + ring buffer, non-blocking).
  *
- * Wiring (cross TX/RX, common GND):
- *   GPIO17 (UART1_TX) -> STM32 PA3 (USART2_RX)
- *   GPIO18 (UART1_RX) <- STM32 PA2 (USART2_TX)
- *   WS2812 data: GPIO48 (DevKitC-1 v1.0; v1.1 uses a solder jumper, else GPIO38)
- *   Button: GPIO10 to GND, internal pull-up (wired on DevKitC-1)
+ * Wiring:
+ *   Potentiometer wiper -> GPIO4 (ADC1_CH3), ends -> 3V3 and GND  (never above 3.3 V!)
+ *   Console/UART: Micro-USB port -> on-board USB-UART bridge -> UART0 (GPIO43 TX / GPIO44 RX
+ *   on DevKitC-1, these are the chip defaults, so no uart_set_pin() call is needed).
+ *   GPIO17/18 (U1TXD/U1RXD) stay free for the STM32 link of lesson 4.1.
  *
- * Frame, both directions, 115200 8N1:
- *   0xA5 | cmd (CMD_TOGGLE_LEDS) | header^cmd  (wrong checksum -> frame dropped)
+ * Tasks from the practice:
+ *   2.1  LOG_FRAME_EDGES=1 logs first/last raw value of each DMA frame (temporary debug)
+ *   5.1  read buffer is allocated with MALLOC_CAP_DMA (see dma_buffer note below)
+ *   6.1  per-frame line: raw min/max/avg/vpp + volts, several times per second
+ *   6.2  rolling window (AGG_WINDOW_MS) accumulates min/max/avg/vpp over several frames
+ *        -> the optional "console oscilloscope"
  */
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
-#include "driver/uart.h"
+#include "esp_adc/adc_continuous.h"
 #include "esp_err.h"
-#include "esp_log.h"
-#include "esp_rom_sys.h"
 #include "esp_heap_caps.h"
-#include "esp_cpu.h"
-#include "soc/soc.h"
-#include "soc/gpio_reg.h"
+#include "esp_log.h"
+#include "driver/uart.h"
 
-static const char *TAG = "uart_link";
+static const char *TAG = "adc_dma_uart";
 
-/* ----- Pin map ----- */
-#define BTN_PIN            GPIO_NUM_10
-#define ONBOARD_RGB_PIN    GPIO_NUM_48   /* WS2812 data on DevKitC-1, v1.0 */
-#define UART_PORT          UART_NUM_1
-#define UART_TX_PIN        GPIO_NUM_17   /* -> STM32 PA3 (USART2_RX)  */
-#define UART_RX_PIN        GPIO_NUM_18   /* <- STM32 PA2 (USART2_TX) — matches wiring doc above! */
-#define UART_BAUD          115200
+/* ----- ADC1 continuous (P2M DMA), practice Part 2 ----- */
+#define ADC_UNIT        ADC_UNIT_1
+#define ADC_CHANNEL     ADC_CHANNEL_3      /* GPIO4 on ESP32-S3 = ADC1_CH3 */
+#define ADC_ATTEN       ADC_ATTEN_DB_12    /* full range, ~0-3.3 V */
+#define ADC_BIT_WIDTH   ADC_BITWIDTH_12
+#define SAMPLE_FREQ_HZ  20000              /* plenty for a potentiometer */
 
-/* ----- Protocol ----- */
-#define FRAME_HEADER       0xA5U
-#define CMD_TOGGLE_LEDS    0x01U
-#define FRAME_LEN          3U
+#define FRAME_SIZE      256   /* bytes in ONE ready block  == conv_frame_size == I2S dma_buf_len */
+#define POOL_FRAMES     4     /* blocks kept in the ring at once == I2S dma_buf_count            */
+                              /* FRAME_SIZE is a multiple of SOC_ADC_DIGI_DATA_BYTES_PER_CONV (4) */
 
-/* WS2812 bit-banging via CPU cycle counter:
- * esp_rom_delay_us() only has 1 us resolution, too coarse for WS2812 edges,
- * so we busy-wait on esp_cpu_get_cycle_count() against absolute deadlines
- * (loop overhead absorbed). Counter calibrated at init, >=40 MHz.
- * WS2812-B: T1H~900ns T1L~350ns, T0H~380ns, bit ~1.25us. */
-#define WS2812_RESET_US       60U  /* >50µs reset */
+/* FRAME_SIZE/4 = 64 samples per frame -> 20000/64 ~= 312 frames/s.
+ * Printing every frame would push ~312*60 B/s > 115200 baud capacity (~11.5 KB/s)
+ * and would eventually block in uart_write_bytes(). So the per-frame line is
+ * throttled: ~10 lines/s, which is what task 6.1 asks for. */
+#define FRAME_PRINT_INTERVAL_MS 100
+#define AGG_WINDOW_MS           1000   /* task 6.2: oscilloscope-style window */
+#define LOG_FRAME_EDGES         1      /* task 2.1: first/last raw of each printed frame, 0 to silence */
 
-static uint32_t s_ticks_per_us;
-static uint32_t s_bit1_high_t, s_bit0_high_t, s_bit_total_t;
+/* ----- UART (practice Part 3) ----- */
+#define UART_PORT       UART_NUM_0       /* on-board USB-UART bridge = console */
+#define UART_BAUD       115200
+#define UART_RX_BUF     0                /* TX only here */
+#define UART_TX_BUF     1024             /* MUST be > 0: non-blocking uart_write_bytes()
+                                          * (with 0 the call blocks on the 128-byte HW FIFO) */
 
-#define RGB_OUT_REG_SEL  ((ONBOARD_RGB_PIN) < 32 ? GPIO_OUT_REG : GPIO_OUT1_REG)
-#define RGB_OUT_BIT       (1U << ((ONBOARD_RGB_PIN) & 31U))
+/* ADC full-scale for the raw -> volt conversion (12 bit, ATTEN_DB_12) */
+#define ADC_FULL_SCALE_RAW  4095.0f
+#define ADC_FULL_SCALE_V    3.3f
 
-static inline void rgb_pin_level(int lvl)
+static adc_continuous_handle_t s_adc_handle;
+static TaskHandle_t            s_adc_task_handle;
+static uint8_t                *s_dma_buf;          /* MALLOC_CAP_DMA, Part 5 */
+static volatile uint32_t       s_pool_overflow_cnt;
+
+/* ------------------------------------------------------------------ */
+/* UART init (Part 3)                                                  */
+/* ------------------------------------------------------------------ */
+static void uart_init(void)
 {
-    /* Direct register write: gpio_set_level() is too slow (~µs) for bit-banging */
-    if (lvl) { SET_PERI_REG_MASK(RGB_OUT_REG_SEL, RGB_OUT_BIT); }
-    else     { CLEAR_PERI_REG_MASK(RGB_OUT_REG_SEL, RGB_OUT_BIT); }
-}
-
-static void ws2812_timing_init(void)
-{
-    uint32_t c0 = esp_cpu_get_cycle_count();
-    esp_rom_delay_us(1000);
-    s_ticks_per_us = (esp_cpu_get_cycle_count() - c0) / 1000;
-    if (s_ticks_per_us < 1) s_ticks_per_us = 40; /* fallback: 40 MHz XTAL */
-
-    /* Targets per WS2812-B: T1H=0.8µs, T0H=0.4µs, bit period=1.3µs */
-    s_bit1_high_t = ((8u * s_ticks_per_us) + 5u) / 10u;
-    s_bit0_high_t = ((4u * s_ticks_per_us) + 5u) / 10u;
-    if (s_bit0_high_t < 1) s_bit0_high_t = 1;
-    s_bit_total_t = ((13u * s_ticks_per_us) + 5u) / 10u;
-}
-
-static inline void ws2812_send_bit(uint32_t high_t)
-{
-    uint32_t start = esp_cpu_get_cycle_count();
-    rgb_pin_level(1);
-    while ((uint32_t)(esp_cpu_get_cycle_count() - start) < high_t) { }
-    rgb_pin_level(0);
-    while ((uint32_t)(esp_cpu_get_cycle_count() - start) < s_bit_total_t) { }
-}
-
-static portMUX_TYPE s_led_mux = portMUX_INITIALIZER_UNLOCKED;
-
-/* Send 24-bit color, GRB order, MSB first per channel. */
-static void ws2812_send_color(uint8_t g, uint8_t r, uint8_t b)
-{
-    /* Spinlock + IRQ off: keeps the whole ~30 us frame atomic on both cores, so
-     * tasks cannot interleave bits and no ISR can stretch a bit past the reset
-     * timeout mid-frame. */
-    portENTER_CRITICAL(&s_led_mux);
-    for (int i = 7; i >= 0; i--) ws2812_send_bit(((g >> i) & 1) ? s_bit1_high_t : s_bit0_high_t);
-    for (int i = 7; i >= 0; i--) ws2812_send_bit(((r >> i) & 1) ? s_bit1_high_t : s_bit0_high_t);
-    for (int i = 7; i >= 0; i--) ws2812_send_bit(((b >> i) & 1) ? s_bit1_high_t : s_bit0_high_t);
-    rgb_pin_level(0);
-    esp_rom_delay_us(WS2812_RESET_US); /* latch / reset */
-    portEXIT_CRITICAL(&s_led_mux);
-}
-
-static bool s_led_on = false;   /* logical on/off requested by the peer */
-
-static void ws2812_apply_state(void)
-{
-    if (s_led_on) ws2812_send_color(50, 0, 0);        /* green */
-    else         ws2812_send_color(0, 0, 0);
-}
-
-/* Frame parser state */
-static uint8_t  s_rx_buf[FRAME_LEN];
-static uint8_t  s_rx_pos = 0;
-
-/* Activity flag for status LED flash */
-static volatile bool s_activity_pulse = false;
-
-/* Button debounce */
-#define BUTTON_DEBOUNCE_MS 300
-static volatile uint32_t s_last_button_time = 0;
-
-static void uart_link_init(void)
-{
-    uart_config_t uart_cfg = {
+    uart_config_t cfg = {
         .baud_rate  = UART_BAUD,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
@@ -133,178 +82,279 @@ static void uart_link_init(void)
         .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_cfg));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN,
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &cfg));
+    /* UART0 default pins are used (GPIO43/44 on ESP32-S3, wired to the USB-UART
+     * bridge on DevKitC-1). For another port, e.g. UART1 on GPIO17/18:
+     *   ESP_ERROR_CHECK(uart_set_pin(UART_PORT, 17, 18, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+     */
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_RX_BUF, UART_TX_BUF, 0, NULL, 0));
 }
 
-static void send_toggle_frame(void)
+/* ------------------------------------------------------------------ */
+/* ADC continuous + DMA init (Part 2)                                  */
+/* ------------------------------------------------------------------ */
+
+/* Runs in ISR context (GDMA done interrupt). Analogue of HAL_ADC_ConvCpltCallback on STM32:
+ * only wakes the consumer task, never processes data here. */
+static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
+                                       const adc_continuous_evt_data_t *edata, void *user_data)
 {
-    uint8_t frame[FRAME_LEN] = {
-        FRAME_HEADER,
-        CMD_TOGGLE_LEDS,
-        FRAME_HEADER ^ CMD_TOGGLE_LEDS,
+    (void)handle; (void)edata; (void)user_data;
+    BaseType_t must_yield = pdFALSE;
+    vTaskNotifyGiveFromISR(s_adc_task_handle, &must_yield);
+    return must_yield == pdTRUE;
+}
+
+/* Fires when the whole ring (POOL_FRAMES frames) is full of unread data:
+ * this is the ESP-IDF version of "CPU is too slow, Circular mode overwrote data". */
+static bool IRAM_ATTR adc_pool_ovf_cb(adc_continuous_handle_t handle,
+                                      const adc_continuous_evt_data_t *edata, void *user_data)
+{
+    (void)handle; (void)edata; (void)user_data;
+    s_pool_overflow_cnt++;
+    return false;
+}
+
+static esp_err_t adc_dma_init(void)
+{
+    adc_continuous_handle_cfg_t handle_cfg = {
+        .max_store_buf_size = FRAME_SIZE * POOL_FRAMES,  /* ring capacity: dma_buf_count * dma_buf_len */
+        .conv_frame_size    = FRAME_SIZE,                /* size of ONE ready block: on_conv_done fires here */
+        .flags = { .flush_pool = 0 },                    /* 0 = keep oldest frames, drop newest when full */
     };
-    uart_write_bytes(UART_PORT, (const char *)frame, sizeof(frame));
-    s_activity_pulse = true;
-    ESP_LOGI(TAG, "TX: toggle request -> STM32");
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &s_adc_handle));
+
+    adc_digi_pattern_config_t pattern[1] = {
+        {
+            .atten     = ADC_ATTEN,
+            .channel   = ADC_CHANNEL,
+            .unit      = ADC_UNIT,
+            .bit_width = ADC_BIT_WIDTH,
+        },
+    };
+    adc_continuous_config_t dig_cfg = {
+        .pattern_num   = 1,                 /* >1: several channels interleaved in one DMA stream */
+        .adc_pattern   = pattern,
+        .sample_freq_hz = SAMPLE_FREQ_HZ,
+        .conv_mode     = ADC_CONV_SINGLE_UNIT_1,
+        .format        = ADC_DIGI_OUTPUT_FORMAT_TYPE2,   /* TYPE2 = ESP32-S3 output format */
+    };
+    esp_err_t err = adc_continuous_config(s_adc_handle, &dig_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "adc_continuous_config failed: %s (sample_freq_hz out of range?)",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    adc_continuous_evt_cbs_t cbs = {
+        .on_conv_done = adc_conv_done_cb,
+        .on_pool_ovf  = adc_pool_ovf_cb,
+    };
+    /* v5.x signature takes user_data as the 3rd argument (passed to every callback) */
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(s_adc_handle, &cbs, NULL));
+    return ESP_OK;
 }
 
-/* Parse single byte, returns true if a valid cmd was parsed */
-static bool parse_byte(uint8_t b)
+/* ------------------------------------------------------------------ */
+/* Processing + UART output (Part 6)                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint32_t vmin;
+    uint32_t vmax;
+    uint32_t vavg;
+    uint32_t vpp;
+    uint32_t samples;
+} stats_t;
+
+/* Rolling window (task 6.2): accumulates several consecutive frames. */
+typedef struct {
+    uint32_t vmin;
+    uint32_t vmax;
+    uint64_t sum;
+    uint32_t samples;
+    uint32_t frames;
+    uint32_t start_tick;
+} window_t;
+
+static void stats_from_frame(adc_digi_output_data_t *data, int count, stats_t *out)
 {
-    if (s_rx_pos == 0) {
-        if (b == FRAME_HEADER) {
-            s_rx_buf[s_rx_pos++] = b;
-        }
-        return false;
+    uint32_t sum = 0;
+    uint32_t vmin = 0xFFFFFFFFu, vmax = 0;
+
+    for (int i = 0; i < count; i++) {
+        /* TYPE2 carries the channel id together with the raw value — needed when
+         * pattern_num > 1, because the driver interleaves channels in one stream. */
+        uint32_t raw = data[i].type2.data;
+        sum += raw;
+        if (raw < vmin) vmin = raw;
+        if (raw > vmax) vmax = raw;
     }
 
-    s_rx_buf[s_rx_pos++] = b;
-
-    if (s_rx_pos < FRAME_LEN) {
-        return false;
-    }
-
-    uint8_t crc_calc = s_rx_buf[0] ^ s_rx_buf[1];
-    s_rx_pos = 0;
-
-    if (s_rx_buf[2] != crc_calc) {
-        ESP_LOGW(TAG, "Bad checksum: recv 0x%02X, expect 0x%02X", s_rx_buf[2], crc_calc);
-        return false;
-    }
-    s_activity_pulse = true;
-    return true;
+    out->vmin    = vmin;
+    out->vmax    = vmax;
+    out->vavg    = sum / (uint32_t)count;
+    out->vpp     = vmax - vmin;
+    out->samples = (uint32_t)count;
 }
 
-static void handle_cmd(uint8_t cmd)
+static void window_reset(window_t *w, uint32_t now_tick)
 {
-    if (cmd == CMD_TOGGLE_LEDS) {
-        s_led_on = !s_led_on;
-        ws2812_apply_state();
-        ESP_LOGI(TAG, "RX: toggle from STM32 -> LED %s", s_led_on ? "ON" : "OFF");
-    } else {
-        ESP_LOGW(TAG, "RX: unknown cmd 0x%02X", cmd);
+    w->vmin = 0xFFFFFFFFu;
+    w->vmax = 0;
+    w->sum = 0;
+    w->samples = 0;
+    w->frames = 0;
+    w->start_tick = now_tick;
+}
+
+static void window_accumulate(window_t *w, const stats_t *f)
+{
+    if (f->vmin < w->vmin) w->vmin = f->vmin;
+    if (f->vmax > w->vmax) w->vmax = f->vmax;
+    w->sum += (uint64_t)f->vavg * f->samples;   /* per-frame sum is 32 bit, window sum is 64 bit */
+    w->samples += f->samples;
+    w->frames++;
+}
+
+static void window_report(window_t *w, uint32_t now_tick)
+{
+    if (w->samples == 0) return;
+
+    uint32_t avg = (uint32_t)(w->sum / w->samples);
+    uint32_t vpp = w->vmax - w->vmin;
+    uint32_t dur_ms = (uint32_t)(now_tick - w->start_tick) * (1000 / configTICK_RATE_HZ);
+    float v_avg = (avg / ADC_FULL_SCALE_RAW) * ADC_FULL_SCALE_V;
+
+    char line[128];
+    int n = snprintf(line, sizeof(line),
+                     "win %3lu ms (%2lu frames, %4lu smp): min=%4lu max=%4lu avg=%4lu vpp=%4lu | avg=%.2fV\r\n",
+                     (unsigned long)dur_ms, (unsigned long)w->frames, (unsigned long)w->samples,
+                     (unsigned long)w->vmin, (unsigned long)w->vmax, (unsigned long)avg,
+                     (unsigned long)vpp, v_avg);
+    if (n > 0) {
+        uart_write_bytes(UART_PORT, line, (size_t)n);   /* copies into the driver ring, returns at once */
     }
 }
 
-/* ---- Tasks ---- */
+/* Split of the practice's process_and_send(): stats_from_frame() does the math,
+ * send_frame_line() does the UART output. Split because the window (task 6.2)
+ * needs every frame, while the console line is throttled (see FRAME_PRINT_INTERVAL_MS). */
+static void send_frame_line(const stats_t *f)
+{
+    float v_avg = (f->vavg / ADC_FULL_SCALE_RAW) * ADC_FULL_SCALE_V;
 
-static void rx_task(void *arg)
+    char line[96];
+    int n = snprintf(line, sizeof(line),
+                     "raw: min=%lu max=%lu avg=%lu vpp=%lu | avg=%.2fV\r\n",
+                     (unsigned long)f->vmin, (unsigned long)f->vmax,
+                     (unsigned long)f->vavg, (unsigned long)f->vpp, v_avg);
+    if (n > 0) {
+        uart_write_bytes(UART_PORT, line, (size_t)n);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Consumer task (analogue of the STM32 while(1) + volatile flags)     */
+/* ------------------------------------------------------------------ */
+static void adc_read_task(void *arg)
 {
     (void)arg;
-    uint8_t byte;
+    uint32_t bytes_read = 0;
+    const uint32_t print_period = pdMS_TO_TICKS(FRAME_PRINT_INTERVAL_MS);
+    const uint32_t window_len   = pdMS_TO_TICKS(AGG_WINDOW_MS);
+    window_t win;
+    uint32_t last_print_tick = 0;
+
+    ESP_ERROR_CHECK(adc_continuous_start(s_adc_handle));
+    window_reset(&win, xTaskGetTickCount());
 
     while (1) {
-        int len = uart_read_bytes(UART_PORT, &byte, 1, pdMS_TO_TICKS(50));
-        if (len > 0) {
-            if (parse_byte(byte)) {
-                handle_cmd(s_rx_buf[1]);
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
-    }
-}
-
-static void status_task(void *arg)
-{
-    (void)arg;
-    while (1) {
-        if (s_activity_pulse) {
-            /* Brief RED flash: note arg order is (g, r, b)! */
-            ws2812_send_color(0, 50, 0);
-            vTaskDelay(pdMS_TO_TICKS(15));
-            ws2812_apply_state();
-            s_activity_pulse = false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-/* ---- Button ISR -- */
-
-static TaskHandle_t s_btn_task = NULL;   /* handle for the ISR to notify */
-
-static void IRAM_ATTR button_isr(void *arg)
-{
-    (void)arg;
-    if (gpio_get_level(BTN_PIN) != 0) return;   /* not pressed */
-
-    uint32_t now = xTaskGetTickCountFromISR() * (1000 / configTICK_RATE_HZ);
-    if (now - s_last_button_time > BUTTON_DEBOUNCE_MS) {
-        s_last_button_time = now;
-        if (s_btn_task == NULL) return;  /* task not created; nothing to wake */
-        BaseType_t hp = pdFALSE;
-        vTaskNotifyGiveFromISR(s_btn_task, &hp);
-        if (hp) portYIELD_FROM_ISR();
-    }
-}
-
-static void button_task(void *arg)
-{
-    (void)arg;
-    while (1) {
+        /* Sleep until adc_conv_done_cb wakes us — the CPU is free while the
+         * ADC + GDMA move samples in the background. No readiness polling at all. */
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        send_toggle_frame();
+
+        /* timeout 0: never block, take the frame that GDMA already finished. */
+        esp_err_t err = adc_continuous_read(s_adc_handle, s_dma_buf, FRAME_SIZE, &bytes_read, 0);
+        if (err == ESP_ERR_TIMEOUT) {
+            continue;                       /* frame not complete yet, keep waiting */
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "adc_continuous_read: %s (pool overflow %lu)",
+                     esp_err_to_name(err), (unsigned long)s_pool_overflow_cnt);
+            continue;
+        }
+
+        int count = (int)(bytes_read / sizeof(adc_digi_output_data_t));
+        if (count <= 0) {
+            continue;
+        }
+
+        adc_digi_output_data_t *data = (adc_digi_output_data_t *)s_dma_buf;
+
+        stats_t f;
+        stats_from_frame(data, count, &f);
+        window_accumulate(&win, &f);
+
+        uint32_t now = xTaskGetTickCount();
+
+        if (now - last_print_tick >= print_period) {
+            last_print_tick = now;
+            send_frame_line(&f);                  /* task 6.1 */
+            /* Task 2.1: first/last raw value of this DMA block (throttled, else the
+             * console gets ~312 lines/s). Set LOG_FRAME_EDGES to 0 to silence. */
+            if (LOG_FRAME_EDGES) {
+                ESP_LOGI(TAG, "frame: first=%lu last=%lu (%d smp)",
+                         (unsigned long)data[0].type2.data,
+                         (unsigned long)data[count - 1].type2.data, count);
+            }
+        }
+
+        if (now - win.start_tick >= window_len) {
+            window_report(&win, now);           /* task 6.2 */
+            window_reset(&win, now);
+        }
     }
 }
 
-/* ---- GPIO init ---- */
-
-static void gpio_init(void)
-{
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << BTN_PIN),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,
-    };
-    gpio_config(&io);
-
-    io.pin_bit_mask = (1ULL << ONBOARD_RGB_PIN);
-    io.mode = GPIO_MODE_OUTPUT;
-    gpio_config(&io);
-
-    /* Reset: ensure line low (WS2812 idle is low) */
-    gpio_set_level(ONBOARD_RGB_PIN, 0);
-}
-
-/* ---- Main ---- */
-
+/* ------------------------------------------------------------------ */
+/* Main                                                                */
+/* ------------------------------------------------------------------ */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "UART link starting (ESP32-S3 <-> STM32F411)");
-    ESP_LOGI(TAG, "GPIO: BTN=%d RGB=%d UART1 TX=%d RX=%d @%d",
-             BTN_PIN, ONBOARD_RGB_PIN, UART_TX_PIN, UART_RX_PIN, UART_BAUD);
+    ESP_LOGI(TAG, "ADC1 continuous (DMA) -> stats -> UART0 @%d", UART_BAUD);
+    ESP_LOGI(TAG, "ADC%d_CH%d (GPIO4) atten=%d width=%d fsampling=%d Hz, frame=%d B x %d pool",
+             ADC_UNIT + 1, ADC_CHANNEL, ADC_ATTEN, ADC_BIT_WIDTH, SAMPLE_FREQ_HZ,
+             FRAME_SIZE, POOL_FRAMES);
 
-    s_led_on = false;
-
-    gpio_init();
-    ws2812_timing_init();   /* must run before any ws2812_send_color() */
-    uart_link_init();
-
-    /* Initial LED state = off (green LED dark) */
-    ws2812_apply_state();
-
-    if (xTaskCreate(rx_task, "rx_task", 4096, NULL, 10, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create rx_task");
-    }
-    if (xTaskCreate(status_task, "status_task", 4096, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create status_task");
-    }
-    if (xTaskCreate(button_task, "btn_task", 4096, NULL, 10, &s_btn_task) != pdPASS ||
-        s_btn_task == NULL) {
-        ESP_LOGE(TAG, "failed to create btn_task");
-        s_btn_task = NULL;
+    /* Part 5: DMA-capable memory. Without MALLOC_CAP_DMA the buffer may land in
+     * PSRAM; the driver would then silently memcpy it into internal SRAM before
+     * the transfer — works, but the CPU pays for the copy (hidden slowdown). */
+    s_dma_buf = heap_caps_malloc(FRAME_SIZE, MALLOC_CAP_DMA);
+    if (s_dma_buf == NULL) {
+        ESP_LOGE(TAG, "no DMA-capable memory for %d bytes", FRAME_SIZE);
+        return;
     }
 
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(BTN_PIN, button_isr, NULL);
+    uart_init();
 
-    ESP_LOGI(TAG, "free internal heap: %u bytes", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    if (adc_dma_init() != ESP_OK) {
+        heap_caps_free(s_dma_buf);
+        s_dma_buf = NULL;
+        return;
+    }
 
-    ESP_LOGI(TAG, "Ready: press button to toggle STM32 LED; green LED shows toggle state");
+    if (xTaskCreate(adc_read_task, "adc_read_task", 4096, NULL, 5, &s_adc_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create adc_read_task");
+        ESP_ERROR_CHECK(adc_continuous_deinit(s_adc_handle));
+        heap_caps_free(s_dma_buf);
+        s_dma_buf = NULL;
+        return;
+    }
+
+    ESP_LOGI(TAG, "free DMA-capable heap: %u bytes",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    /* app_main() returns on purpose: adc_read_task keeps running under the
+     * scheduler, there is no "main while(1)" here (unlike bare-metal STM32). */
+    ESP_LOGI(TAG, "ready: turn the potentiometer on GPIO4, watch console lines");
 }
