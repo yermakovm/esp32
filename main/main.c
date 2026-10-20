@@ -56,9 +56,11 @@ static const char *TAG = "adc_dma_uart";
 /* ----- UART (practice Part 3) ----- */
 #define UART_PORT       UART_NUM_0       /* on-board USB-UART bridge = console */
 #define UART_BAUD       115200
-#define UART_RX_BUF     0                /* TX only here */
-#define UART_TX_BUF     1024             /* MUST be > 0: non-blocking uart_write_bytes()
-                                          * (with 0 the call blocks on the 128-byte HW FIFO) */
+#define UART_RX_BUF     256            /* MUST be > 128 (ESP32-S3 HW FIFO), ESP-IDF v5.x rejects
+                                        * rx_buffer_size <= UART_HW_FIFO_LEN -> "uart rx buffer length error".
+                                        * The practice doc's rx=0 snippet does not work on v5.x. */
+#define UART_TX_BUF     1024            /* > 128 (or 0). >0 = non-blocking uart_write_bytes()
+                                         * (with 0 the call blocks on the 128-byte HW FIFO) */
 
 /* ADC full-scale for the raw -> volt conversion (12 bit, ATTEN_DB_12) */
 #define ADC_FULL_SCALE_RAW  4095.0f
