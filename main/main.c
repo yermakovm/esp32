@@ -1,362 +1,353 @@
-/**
- * Lesson 4.6 — DMA: ADC1 continuous mode (GDMA) -> processing -> UART (ESP32-S3)
- * Source practice: practice_dma_adc_uart_esp-idf.md (Parts 2, 3, 5, 6)
- *
- * Chain: ADC1 samples continuously into a ring of DMA frames (no CPU polling)
- *        -> ISR wakes adc_read_task -> statistics (min/max/vpp/avg)
- *        -> uart_write_bytes() on UART0 (interrupt + ring buffer, non-blocking).
- *
- * Wiring:
- *   Potentiometer wiper -> GPIO4 (ADC1_CH3), ends -> 3V3 and GND  (never above 3.3 V!)
- *   Console/UART: Micro-USB port -> on-board USB-UART bridge -> UART0 (GPIO43 TX / GPIO44 RX
- *   on DevKitC-1, these are the chip defaults, so no uart_set_pin() call is needed).
- *   GPIO17/18 (U1TXD/U1RXD) stay free for the STM32 link of lesson 4.1.
- *
- * Tasks from the practice:
- *   2.1  LOG_FRAME_EDGES=1 logs first/last raw value of each DMA frame (temporary debug)
- *   5.1  read buffer is allocated with MALLOC_CAP_DMA (see dma_buffer note below)
- *   6.1  per-frame line: raw min/max/avg/vpp + volts, several times per second
- *   6.2  rolling window (AGG_WINDOW_MS) accumulates min/max/avg/vpp over several frames
- *        -> the optional "console oscilloscope"
- */
-
-#include <stdbool.h>
-#include <stdint.h>
 #include <stdio.h>
+#include <math.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_adc/adc_continuous.h"
-#include "esp_err.h"
-#include "esp_heap_caps.h"
+
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "driver/gptimer.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_timer.h"
 #include "esp_log.h"
-#include "driver/uart.h"
 
-static const char *TAG = "adc_dma_uart";
+#define LED_PWM_GPIO        4
+#define LDR_ADC_GPIO        5
+#define BUTTON_GPIO         GPIO_NUM_0
 
-/* ----- ADC1 continuous (P2M DMA), practice Part 2 ----- */
-#define ADC_UNIT        ADC_UNIT_1
-#define ADC_CHANNEL     ADC_CHANNEL_3      /* GPIO4 on ESP32-S3 = ADC1_CH3 */
-#define ADC_ATTEN       ADC_ATTEN_DB_12    /* full range, ~0-3.3 V */
-#define ADC_BIT_WIDTH   ADC_BITWIDTH_12
-#define SAMPLE_FREQ_HZ  20000              /* plenty for a potentiometer */
+#define LEDC_DUTY_BITS      LEDC_TIMER_10_BIT
+#define LEDC_PWM_FREQ_HZ    5000
+#define PWM_MAX_DUTY        ((1 << LEDC_DUTY_BITS) - 1)
 
-#define FRAME_SIZE      256   /* bytes in ONE ready block  == conv_frame_size == I2S dma_buf_len */
-#define POOL_FRAMES     4     /* blocks kept in the ring at once == I2S dma_buf_count            */
-                              /* FRAME_SIZE is a multiple of SOC_ADC_DIGI_DATA_BYTES_PER_CONV (4) */
+static const int MODE_PERCENT[] = { 100, 75, 50, 25 };
+#define MODE_COUNT            (int)(sizeof(MODE_PERCENT) / sizeof(MODE_PERCENT[0]))
 
-/* FRAME_SIZE/4 = 64 samples per frame -> 20000/64 ~= 312 frames/s.
- * Printing every frame would push ~312*60 B/s > 115200 baud capacity (~11.5 KB/s)
- * and would eventually block in uart_write_bytes(). So the per-frame line is
- * throttled: ~10 lines/s, which is what task 6.1 asks for. */
-#define FRAME_PRINT_INTERVAL_MS 100
-#define AGG_WINDOW_MS           1000   /* task 6.2: oscilloscope-style window */
-#define LOG_FRAME_EDGES         1      /* task 2.1: first/last raw of each printed frame, 0 to silence */
+#define AUTO_CALIBRATE        1
+#define CALI_SETTLE_MS        800
+#define CALI_SAMPLES          50
 
-/* ----- UART (practice Part 3) ----- */
-#define UART_PORT       UART_NUM_0       /* on-board USB-UART bridge = console */
-#define UART_BAUD       115200
-#define UART_RX_BUF     256            /* MUST be > 128 (ESP32-S3 HW FIFO), ESP-IDF v5.x rejects
-                                        * rx_buffer_size <= UART_HW_FIFO_LEN -> "uart rx buffer length error".
-                                        * The practice doc's rx=0 snippet does not work on v5.x. */
-#define UART_TX_BUF     1024            /* > 128 (or 0). >0 = non-blocking uart_write_bytes()
-                                         * (with 0 the call blocks on the 128-byte HW FIFO) */
+#define MV_DARK_REF           300
+#define MV_FULL_REF           2900
+#define MIN_SPAN_MV           150
 
-/* ADC full-scale for the raw -> volt conversion (12 bit, ATTEN_DB_12) */
-#define ADC_FULL_SCALE_RAW  4095.0f
-#define ADC_FULL_SCALE_V    3.3f
+#define PID_KP                1000.0f
+#define PID_KI                300.0f
+#define PID_KD                50.0f
+#define PID_DT_S              0.01f
+#define PID_PERIOD_US         10000
+#define PID_D_ALPHA           0.8f
 
-static adc_continuous_handle_t s_adc_handle;
-static TaskHandle_t            s_adc_task_handle;
-static uint8_t                *s_dma_buf;          /* MALLOC_CAP_DMA, Part 5 */
-static volatile uint32_t       s_pool_overflow_cnt;
+#define ADC_ATTEN             ADC_ATTEN_DB_12
+#define ADC_FILTER_ALPHA      0.4f
 
-/* ------------------------------------------------------------------ */
-/* UART init (Part 3)                                                  */
-/* ------------------------------------------------------------------ */
-static void uart_init(void)
+static const char *TAG = "ldr_led_pid";
+
+static void led_pwm_init(void)
 {
-    uart_config_t cfg = {
-        .baud_rate  = UART_BAUD,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_DUTY_BITS,
+        .timer_num       = LEDC_TIMER_0,
+        .freq_hz         = LEDC_PWM_FREQ_HZ,
+        .clk_cfg         = LEDC_AUTO_CLK,
     };
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &cfg));
-    /* UART0 default pins are used (GPIO43/44 on ESP32-S3, wired to the USB-UART
-     * bridge on DevKitC-1). For another port, e.g. UART1 on GPIO17/18:
-     *   ESP_ERROR_CHECK(uart_set_pin(UART_PORT, 17, 18, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-     */
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_RX_BUF, UART_TX_BUF, 0, NULL, 0));
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
+
+    ledc_channel_config_t chan_cfg = {
+        .gpio_num   = LED_PWM_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .timer_sel  = LEDC_TIMER_0,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
 }
 
-/* ------------------------------------------------------------------ */
-/* ADC continuous + DMA init (Part 2)                                  */
-/* ------------------------------------------------------------------ */
-
-/* Runs in ISR context (GDMA done interrupt). Analogue of HAL_ADC_ConvCpltCallback on STM32:
- * only wakes the consumer task, never processes data here. */
-static bool IRAM_ATTR adc_conv_done_cb(adc_continuous_handle_t handle,
-                                       const adc_continuous_evt_data_t *edata, void *user_data)
+static void led_set_duty(uint32_t duty)
 {
-    (void)handle; (void)edata; (void)user_data;
-    BaseType_t must_yield = pdFALSE;
-    vTaskNotifyGiveFromISR(s_adc_task_handle, &must_yield);
-    return must_yield == pdTRUE;
+    if (duty > PWM_MAX_DUTY) duty = PWM_MAX_DUTY;
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-/* Fires when the whole ring (POOL_FRAMES frames) is full of unread data:
- * this is the ESP-IDF version of "CPU is too slow, Circular mode overwrote data". */
-static bool IRAM_ATTR adc_pool_ovf_cb(adc_continuous_handle_t handle,
-                                      const adc_continuous_evt_data_t *edata, void *user_data)
-{
-    (void)handle; (void)edata; (void)user_data;
-    s_pool_overflow_cnt++;
-    return false;
-}
+static adc_oneshot_unit_handle_t adc_handle = NULL;
+static adc_cali_handle_t         cali_handle = NULL;
+static adc_channel_t             ldr_chan = 0;
+static bool                      cali_ok = false;
 
-static esp_err_t adc_dma_init(void)
+static void ldr_adc_init(void)
 {
-    adc_continuous_handle_cfg_t handle_cfg = {
-        .max_store_buf_size = FRAME_SIZE * POOL_FRAMES,  /* ring capacity: dma_buf_count * dma_buf_len */
-        .conv_frame_size    = FRAME_SIZE,                /* size of ONE ready block: on_conv_done fires here */
-        .flags = { .flush_pool = 0 },                    /* 0 = keep oldest frames, drop newest when full */
-    };
-    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle_cfg, &s_adc_handle));
+    adc_unit_t unit;
+    adc_channel_t chan;
+    ESP_ERROR_CHECK(adc_oneshot_io_to_channel(LDR_ADC_GPIO, &unit, &chan));
+    ldr_chan = chan;
+    ESP_LOGI(TAG, "LDR on GPIO%d -> %s_CH%d", LDR_ADC_GPIO,
+             unit == ADC_UNIT_1 ? "ADC1" : "ADC2", chan);
 
-    adc_digi_pattern_config_t pattern[1] = {
-        {
-            .atten     = ADC_ATTEN,
-            .channel   = ADC_CHANNEL,
-            .unit      = ADC_UNIT,
-            .bit_width = ADC_BIT_WIDTH,
-        },
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten    = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    adc_continuous_config_t dig_cfg = {
-        .pattern_num   = 1,                 /* >1: several channels interleaved in one DMA stream */
-        .adc_pattern   = pattern,
-        .sample_freq_hz = SAMPLE_FREQ_HZ,
-        .conv_mode     = ADC_CONV_SINGLE_UNIT_1,
-        .format        = ADC_DIGI_OUTPUT_FORMAT_TYPE2,   /* TYPE2 = ESP32-S3 output format */
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, chan, &chan_cfg));
+
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .chan     = chan,
+        .atten    = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    esp_err_t err = adc_continuous_config(s_adc_handle, &dig_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "adc_continuous_config failed: %s (sample_freq_hz out of range?)",
+    esp_err_t err = adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali_handle);
+    cali_ok = (err == ESP_OK);
+    if (!cali_ok) {
+        ESP_LOGW(TAG, "ADC calibration unavailable (%s), using raw*3300/4095",
                  esp_err_to_name(err));
-        return err;
+    }
+}
+
+static int ldr_read_mv(int *out_raw)
+{
+    int raw = 0;
+    ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ldr_chan, &raw));
+    if (out_raw) *out_raw = raw;
+
+    int mv = 0;
+    if (cali_ok) {
+        adc_cali_raw_to_voltage(cali_handle, raw, &mv);
+    } else {
+        mv = (int)((float)raw * 3300.0f / 4095.0f);
+    }
+    return mv;
+}
+
+typedef struct {
+    float kp, ki, kd;
+    float dt;
+    float integral, integral_min, integral_max;
+    float out_min, out_max;
+    float prev_error;
+    float d_filtered;
+    float d_alpha;
+    bool  enable_i;
+    bool  enable_d;
+} pid_t;
+
+static void pid_init(pid_t *p, float kp, float ki, float kd, float dt, float out_min, float out_max)
+{
+    p->kp = kp; p->ki = ki; p->kd = kd; p->dt = dt;
+    p->integral = 0.0f;
+    p->out_min = out_min; p->out_max = out_max;
+    p->integral_min = (ki > 0.0f) ? out_min / ki : 0.0f;
+    p->integral_max = (ki > 0.0f) ? out_max / ki : 0.0f;
+    p->prev_error = 0.0f;
+    p->d_filtered = 0.0f;
+    p->d_alpha = PID_D_ALPHA;
+    p->enable_i = true;
+    p->enable_d = (kd > 0.0f);
+}
+
+static float pid_compute(pid_t *p, float setpoint, float measurement)
+{
+    float error = setpoint - measurement;
+
+    float p_term = p->kp * error;
+
+    float i_term = 0.0f;
+    if (p->enable_i) {
+        p->integral += error * p->dt;
+        if (p->integral > p->integral_max) p->integral = p->integral_max;
+        if (p->integral < p->integral_min) p->integral = p->integral_min;
+        i_term = p->ki * p->integral;
     }
 
-    adc_continuous_evt_cbs_t cbs = {
-        .on_conv_done = adc_conv_done_cb,
-        .on_pool_ovf  = adc_pool_ovf_cb,
+    float d_term = 0.0f;
+    if (p->enable_d) {
+        float d_raw = (error - p->prev_error) / p->dt;
+        p->d_filtered = p->d_alpha * p->d_filtered + (1.0f - p->d_alpha) * d_raw;
+        d_term = p->kd * p->d_filtered;
+    }
+
+    p->prev_error = error;
+
+    float out = p_term + i_term + d_term;
+    if (out > p->out_max) out = p->out_max;
+    if (out < p->out_min) out = p->out_min;
+    return out;
+}
+
+static void pid_reset(pid_t *p)
+{
+    p->integral   = 0.0f;
+    p->d_filtered = 0.0f;
+}
+
+static int mv_dark = MV_DARK_REF;
+static int mv_full = MV_FULL_REF;
+static int mv_span = MV_FULL_REF - MV_DARK_REF;
+
+static int average_mv_at_duty(uint32_t duty, int samples)
+{
+    led_set_duty(duty);
+    vTaskDelay(pdMS_TO_TICKS(CALI_SETTLE_MS));
+
+    float acc = 0.0f;
+    for (int i = 0; i < samples; i++) {
+        int mv = ldr_read_mv(NULL);
+        acc = (i == 0) ? (float)mv : (ADC_FILTER_ALPHA * mv + (1.0f - ADC_FILTER_ALPHA) * acc);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return (int)(acc + 0.5f);
+}
+
+static void calibrate_range(void)
+{
+#if AUTO_CALIBRATE
+    ESP_LOGI(TAG, "calibrating: LED off ...");
+    mv_dark = average_mv_at_duty(0, CALI_SAMPLES);
+
+    ESP_LOGI(TAG, "calibrating: LED 100%% ...");
+    mv_full = average_mv_at_duty(PWM_MAX_DUTY, CALI_SAMPLES);
+
+    led_set_duty(0);
+#else
+    ESP_LOGI(TAG, "using fixed reference: %d / %d mV", MV_DARK_REF, MV_FULL_REF);
+#endif
+
+    mv_span = mv_full - mv_dark;
+    ESP_LOGI(TAG, "reference: dark=%d mV, full=%d mV, span=%d mV", mv_dark, mv_full, mv_span);
+
+    if (mv_span < MIN_SPAN_MV) {
+        ESP_LOGE(TAG, "span too small (<%d mV): LED light does not reach the LDR", MIN_SPAN_MV);
+        mv_full = mv_dark + MIN_SPAN_MV;
+        mv_span = MIN_SPAN_MV;
+    }
+}
+
+static int mode_index = 0;
+
+static void button_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
-    /* v5.x signature takes user_data as the 3rd argument (passed to every callback) */
-    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(s_adc_handle, &cbs, NULL));
-    return ESP_OK;
+    gpio_config(&io_conf);
 }
 
-/* ------------------------------------------------------------------ */
-/* Processing + UART output (Part 6)                                   */
-/* ------------------------------------------------------------------ */
-
-typedef struct {
-    uint32_t vmin;
-    uint32_t vmax;
-    uint32_t vavg;
-    uint32_t vpp;
-    uint32_t samples;
-} stats_t;
-
-/* Rolling window (task 6.2): accumulates several consecutive frames. */
-typedef struct {
-    uint32_t vmin;
-    uint32_t vmax;
-    uint64_t sum;
-    uint32_t samples;
-    uint32_t frames;
-    uint32_t start_tick;
-} window_t;
-
-static void stats_from_frame(adc_digi_output_data_t *data, int count, stats_t *out)
+static bool check_button_and_advance_mode(void)
 {
-    uint32_t sum = 0;
-    uint32_t vmin = 0xFFFFFFFFu, vmax = 0;
+    static bool prev_pressed = false;
+    static int64_t last_change_us = 0;
 
-    for (int i = 0; i < count; i++) {
-        /* TYPE2 carries the channel id together with the raw value — needed when
-         * pattern_num > 1, because the driver interleaves channels in one stream. */
-        uint32_t raw = data[i].type2.data;
-        sum += raw;
-        if (raw < vmin) vmin = raw;
-        if (raw > vmax) vmax = raw;
+    bool pressed = (gpio_get_level(BUTTON_GPIO) == 0);
+    int64_t now_us = esp_timer_get_time();
+
+    bool changed = false;
+    if (pressed && !prev_pressed && (now_us - last_change_us > 50000)) {
+        mode_index = (mode_index + 1) % MODE_COUNT;
+        last_change_us = now_us;
+        changed = true;
+        ESP_LOGI(TAG, "mode -> %d%%", MODE_PERCENT[mode_index]);
     }
-
-    out->vmin    = vmin;
-    out->vmax    = vmax;
-    out->vavg    = sum / (uint32_t)count;
-    out->vpp     = vmax - vmin;
-    out->samples = (uint32_t)count;
+    prev_pressed = pressed;
+    return changed;
 }
 
-static void window_reset(window_t *w, uint32_t now_tick)
+static int mode_target_mv(void)
 {
-    w->vmin = 0xFFFFFFFFu;
-    w->vmax = 0;
-    w->sum = 0;
-    w->samples = 0;
-    w->frames = 0;
-    w->start_tick = now_tick;
+    return mv_dark + (int)((float)mv_span * (float)MODE_PERCENT[mode_index] / 100.0f + 0.5f);
 }
 
-static void window_accumulate(window_t *w, const stats_t *f)
+static TaskHandle_t pid_task_handle = NULL;
+
+static bool IRAM_ATTR timer_alarm_cb(gptimer_handle_t timer,
+                                     const gptimer_alarm_event_data_t *edata,
+                                     void *user_ctx)
 {
-    if (f->vmin < w->vmin) w->vmin = f->vmin;
-    if (f->vmax > w->vmax) w->vmax = f->vmax;
-    w->sum += (uint64_t)f->vavg * f->samples;   /* per-frame sum is 32 bit, window sum is 64 bit */
-    w->samples += f->samples;
-    w->frames++;
+    BaseType_t high_task_wakeup = pdFALSE;
+    vTaskNotifyGiveFromISR(pid_task_handle, &high_task_wakeup);
+    return high_task_wakeup == pdTRUE;
 }
 
-static void window_report(window_t *w, uint32_t now_tick)
+static void pid_timer_init(void)
 {
-    if (w->samples == 0) return;
+    gptimer_handle_t gptimer = NULL;
+    gptimer_config_t timer_config = {
+        .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
+        .direction     = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000,
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
 
-    uint32_t avg = (uint32_t)(w->sum / w->samples);
-    uint32_t vpp = w->vmax - w->vmin;
-    uint32_t dur_ms = (uint32_t)(now_tick - w->start_tick) * (1000 / configTICK_RATE_HZ);
-    float v_avg = (avg / ADC_FULL_SCALE_RAW) * ADC_FULL_SCALE_V;
+    gptimer_event_callbacks_t cbs = { .on_alarm = timer_alarm_cb };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(gptimer));
 
-    char line[128];
-    int n = snprintf(line, sizeof(line),
-                     "win %3lu ms (%2lu frames, %4lu smp): min=%4lu max=%4lu avg=%4lu vpp=%4lu | avg=%.2fV\r\n",
-                     (unsigned long)dur_ms, (unsigned long)w->frames, (unsigned long)w->samples,
-                     (unsigned long)w->vmin, (unsigned long)w->vmax, (unsigned long)avg,
-                     (unsigned long)vpp, v_avg);
-    if (n > 0) {
-        uart_write_bytes(UART_PORT, line, (size_t)n);   /* copies into the driver ring, returns at once */
-    }
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = PID_PERIOD_US,
+        .reload_count = 0,
+        .flags.auto_reload_on_alarm = true,
+    };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
+    ESP_ERROR_CHECK(gptimer_start(gptimer));
 }
 
-/* Split of the practice's process_and_send(): stats_from_frame() does the math,
- * send_frame_line() does the UART output. Split because the window (task 6.2)
- * needs every frame, while the console line is throttled (see FRAME_PRINT_INTERVAL_MS). */
-static void send_frame_line(const stats_t *f)
-{
-    float v_avg = (f->vavg / ADC_FULL_SCALE_RAW) * ADC_FULL_SCALE_V;
-
-    char line[96];
-    int n = snprintf(line, sizeof(line),
-                     "raw: min=%lu max=%lu avg=%lu vpp=%lu | avg=%.2fV\r\n",
-                     (unsigned long)f->vmin, (unsigned long)f->vmax,
-                     (unsigned long)f->vavg, (unsigned long)f->vpp, v_avg);
-    if (n > 0) {
-        uart_write_bytes(UART_PORT, line, (size_t)n);
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Consumer task (analogue of the STM32 while(1) + volatile flags)     */
-/* ------------------------------------------------------------------ */
-static void adc_read_task(void *arg)
-{
-    (void)arg;
-    uint32_t bytes_read = 0;
-    const uint32_t print_period = pdMS_TO_TICKS(FRAME_PRINT_INTERVAL_MS);
-    const uint32_t window_len   = pdMS_TO_TICKS(AGG_WINDOW_MS);
-    window_t win;
-    uint32_t last_print_tick = 0;
-
-    ESP_ERROR_CHECK(adc_continuous_start(s_adc_handle));
-    window_reset(&win, xTaskGetTickCount());
-
-    while (1) {
-        /* Sleep until adc_conv_done_cb wakes us — the CPU is free while the
-         * ADC + GDMA move samples in the background. No readiness polling at all. */
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        /* timeout 0: never block, take the frame that GDMA already finished. */
-        esp_err_t err = adc_continuous_read(s_adc_handle, s_dma_buf, FRAME_SIZE, &bytes_read, 0);
-        if (err == ESP_ERR_TIMEOUT) {
-            continue;                       /* frame not complete yet, keep waiting */
-        }
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "adc_continuous_read: %s (pool overflow %lu)",
-                     esp_err_to_name(err), (unsigned long)s_pool_overflow_cnt);
-            continue;
-        }
-
-        int count = (int)(bytes_read / sizeof(adc_digi_output_data_t));
-        if (count <= 0) {
-            continue;
-        }
-
-        adc_digi_output_data_t *data = (adc_digi_output_data_t *)s_dma_buf;
-
-        stats_t f;
-        stats_from_frame(data, count, &f);
-        window_accumulate(&win, &f);
-
-        uint32_t now = xTaskGetTickCount();
-
-        if (now - last_print_tick >= print_period) {
-            last_print_tick = now;
-            send_frame_line(&f);                  /* task 6.1 */
-            /* Task 2.1: first/last raw value of this DMA block (throttled, else the
-             * console gets ~312 lines/s). Set LOG_FRAME_EDGES to 0 to silence. */
-            if (LOG_FRAME_EDGES) {
-                ESP_LOGI(TAG, "frame: first=%lu last=%lu (%d smp)",
-                         (unsigned long)data[0].type2.data,
-                         (unsigned long)data[count - 1].type2.data, count);
-            }
-        }
-
-        if (now - win.start_tick >= window_len) {
-            window_report(&win, now);           /* task 6.2 */
-            window_reset(&win, now);
-        }
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* Main                                                                */
-/* ------------------------------------------------------------------ */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ADC1 continuous (DMA) -> stats -> UART0 @%d", UART_BAUD);
-    ESP_LOGI(TAG, "ADC%d_CH%d (GPIO4) atten=%d width=%d fsampling=%d Hz, frame=%d B x %d pool",
-             ADC_UNIT + 1, ADC_CHANNEL, ADC_ATTEN, ADC_BIT_WIDTH, SAMPLE_FREQ_HZ,
-             FRAME_SIZE, POOL_FRAMES);
+    pid_task_handle = xTaskGetCurrentTaskHandle();
 
-    /* Part 5: DMA-capable memory. Without MALLOC_CAP_DMA the buffer may land in
-     * PSRAM; the driver would then silently memcpy it into internal SRAM before
-     * the transfer — works, but the CPU pays for the copy (hidden slowdown). */
-    s_dma_buf = heap_caps_malloc(FRAME_SIZE, MALLOC_CAP_DMA);
-    if (s_dma_buf == NULL) {
-        ESP_LOGE(TAG, "no DMA-capable memory for %d bytes", FRAME_SIZE);
-        return;
+    led_pwm_init();
+    ldr_adc_init();
+    button_init();
+
+    calibrate_range();
+    pid_timer_init();
+
+    pid_t light_pid;
+    pid_init(&light_pid, PID_KP, PID_KI, PID_KD, PID_DT_S,
+             0.0f, (float)PWM_MAX_DUTY);
+
+    float filt_mv = 0.0f;
+    bool  filt_init = false;
+    int   target_mv = mode_target_mv();
+
+    ESP_LOGI(TAG, "mode %d%% -> target %d mV (span %d mV)",
+             MODE_PERCENT[mode_index], target_mv, mv_span);
+    pid_reset(&light_pid);
+
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        if (check_button_and_advance_mode()) {
+            target_mv = mode_target_mv();
+            pid_reset(&light_pid);
+        }
+
+        int raw = 0;
+        int mv  = ldr_read_mv(&raw);
+
+        filt_mv = filt_init ? (ADC_FILTER_ALPHA * mv + (1.0f - ADC_FILTER_ALPHA) * filt_mv)
+                            : (float)mv;
+        filt_init = true;
+
+        float pv_norm     = (filt_mv - (float)mv_dark) / (float)mv_span;
+        float target_norm = (float)(target_mv - mv_dark) / (float)mv_span;
+
+        float output = pid_compute(&light_pid, target_norm, pv_norm);
+        led_set_duty((uint32_t)output);
+
+        printf("t_ms:%lld|mode:%d|target_mv:%d|pv_mv:%d|error_mV:%d|duty:%d\n",
+               (long long)(esp_timer_get_time() / 1000),
+               MODE_PERCENT[mode_index], target_mv, (int)filt_mv,
+               target_mv - (int)filt_mv, (int)output);
     }
-
-    uart_init();
-
-    if (adc_dma_init() != ESP_OK) {
-        heap_caps_free(s_dma_buf);
-        s_dma_buf = NULL;
-        return;
-    }
-
-    if (xTaskCreate(adc_read_task, "adc_read_task", 4096, NULL, 5, &s_adc_task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create adc_read_task");
-        ESP_ERROR_CHECK(adc_continuous_deinit(s_adc_handle));
-        heap_caps_free(s_dma_buf);
-        s_dma_buf = NULL;
-        return;
-    }
-
-    ESP_LOGI(TAG, "free DMA-capable heap: %u bytes",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
-    /* app_main() returns on purpose: adc_read_task keeps running under the
-     * scheduler, there is no "main while(1)" here (unlike bare-metal STM32). */
-    ESP_LOGI(TAG, "ready: turn the potentiometer on GPIO4, watch console lines");
 }
