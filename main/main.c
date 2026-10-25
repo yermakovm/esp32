@@ -1,353 +1,454 @@
+/*
+ * ESP32 + BME280 (SPI) -> WiFi -> MQTT
+ *
+ * - Connects to WiFi (configurable via menuconfig)
+ * - Reads BME280 over SPI
+ * - Publishes T/P/H to MQTT broker on configurable IP:port
+ * - Subscribes to the same topics for loopback testing
+ * - Publishes 2x per second (500 ms interval)
+ */
+
 #include <stdio.h>
-#include <math.h>
-#include <stdbool.h>
+#include <string.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
-#include "driver/ledc.h"
-#include "driver/gpio.h"
-#include "driver/gptimer.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
-#include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
 
-#define LED_PWM_GPIO        4
-#define LDR_ADC_GPIO        5
-#define BUTTON_GPIO         GPIO_NUM_0
+#include "driver/spi_master.h"
+#include "mqtt_client.h"
 
-#define LEDC_DUTY_BITS      LEDC_TIMER_10_BIT
-#define LEDC_PWM_FREQ_HZ    5000
-#define PWM_MAX_DUTY        ((1 << LEDC_DUTY_BITS) - 1)
+/* -------------------- Kconfig -------------------- */
+#define WIFI_SSID           CONFIG_WIFI_SSID
+#define WIFI_PASS           CONFIG_WIFI_PASSWORD
+#define MQTT_BROKER_IP      CONFIG_MQTT_BROKER_IP
+#define MQTT_BROKER_PORT    CONFIG_MQTT_BROKER_PORT
+#define TOPIC_PREFIX        CONFIG_MQTT_TOPIC_PREFIX
+#define BME280_SCK          CONFIG_BME280_SPI_SCK
+#define BME280_MOSI         CONFIG_BME280_SPI_MOSI
+#define BME280_MISO         CONFIG_BME280_SPI_MISO
+#define BME280_CS           CONFIG_BME280_SPI_CS
 
-static const int MODE_PERCENT[] = { 100, 75, 50, 25 };
-#define MODE_COUNT            (int)(sizeof(MODE_PERCENT) / sizeof(MODE_PERCENT[0]))
+/* -------------------- Topics -------------------- */
+#define TOPIC_TEMP          TOPIC_PREFIX "/temp"
+#define TOPIC_HUM           TOPIC_PREFIX "/hum"
+#define TOPIC_PRES          TOPIC_PREFIX "/pres"
+#define TOPIC_ENV           TOPIC_PREFIX "/env"
 
-#define AUTO_CALIBRATE        1
-#define CALI_SETTLE_MS        800
-#define CALI_SAMPLES          50
+#define TAG                 "bme280_mqtt"
 
-#define MV_DARK_REF           300
-#define MV_FULL_REF           2900
-#define MIN_SPAN_MV           150
-
-#define PID_KP                1000.0f
-#define PID_KI                300.0f
-#define PID_KD                50.0f
-#define PID_DT_S              0.01f
-#define PID_PERIOD_US         10000
-#define PID_D_ALPHA           0.8f
-
-#define ADC_ATTEN             ADC_ATTEN_DB_12
-#define ADC_FILTER_ALPHA      0.4f
-
-static const char *TAG = "ldr_led_pid";
-
-static void led_pwm_init(void)
-{
-    ledc_timer_config_t timer_cfg = {
-        .speed_mode      = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = LEDC_DUTY_BITS,
-        .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = LEDC_PWM_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_cfg));
-
-    ledc_channel_config_t chan_cfg = {
-        .gpio_num   = LED_PWM_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel    = LEDC_CHANNEL_0,
-        .timer_sel  = LEDC_TIMER_0,
-        .duty       = 0,
-        .hpoint     = 0,
-    };
-    ESP_ERROR_CHECK(ledc_channel_config(&chan_cfg));
-}
-
-static void led_set_duty(uint32_t duty)
-{
-    if (duty > PWM_MAX_DUTY) duty = PWM_MAX_DUTY;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-}
-
-static adc_oneshot_unit_handle_t adc_handle = NULL;
-static adc_cali_handle_t         cali_handle = NULL;
-static adc_channel_t             ldr_chan = 0;
-static bool                      cali_ok = false;
-
-static void ldr_adc_init(void)
-{
-    adc_unit_t unit;
-    adc_channel_t chan;
-    ESP_ERROR_CHECK(adc_oneshot_io_to_channel(LDR_ADC_GPIO, &unit, &chan));
-    ldr_chan = chan;
-    ESP_LOGI(TAG, "LDR on GPIO%d -> %s_CH%d", LDR_ADC_GPIO,
-             unit == ADC_UNIT_1 ? "ADC1" : "ADC2", chan);
-
-    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
-
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten    = ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, chan, &chan_cfg));
-
-    adc_cali_curve_fitting_config_t cali_cfg = {
-        .unit_id  = ADC_UNIT_1,
-        .chan     = chan,
-        .atten    = ADC_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    esp_err_t err = adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali_handle);
-    cali_ok = (err == ESP_OK);
-    if (!cali_ok) {
-        ESP_LOGW(TAG, "ADC calibration unavailable (%s), using raw*3300/4095",
-                 esp_err_to_name(err));
-    }
-}
-
-static int ldr_read_mv(int *out_raw)
-{
-    int raw = 0;
-    ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ldr_chan, &raw));
-    if (out_raw) *out_raw = raw;
-
-    int mv = 0;
-    if (cali_ok) {
-        adc_cali_raw_to_voltage(cali_handle, raw, &mv);
-    } else {
-        mv = (int)((float)raw * 3300.0f / 4095.0f);
-    }
-    return mv;
-}
+/* -------------------- BME280 -------------------- */
+#define BME280_REG_CHIP_ID      0xD0
+#define BME280_REG_RESET        0xE0
+#define BME280_REG_STATUS       0xF3
+#define BME280_REG_CTRL_MEAS    0xF4
+#define BME280_REG_CTRL_HUM     0xF2
+#define BME280_REG_CONFIG       0xF5
+#define BME280_REG_DATA         0xF7
+#define BME280_REG_CALIB_00     0x88
+#define BME280_REG_CALIB_26     0xE1
+#define BME280_CHIP_ID          0x60
 
 typedef struct {
-    float kp, ki, kd;
-    float dt;
-    float integral, integral_min, integral_max;
-    float out_min, out_max;
-    float prev_error;
-    float d_filtered;
-    float d_alpha;
-    bool  enable_i;
-    bool  enable_d;
-} pid_t;
+    uint16_t dig_T1;
+    int16_t  dig_T2;
+    int16_t  dig_T3;
+    uint16_t dig_P1;
+    int16_t  dig_P2;
+    int16_t  dig_P3;
+    int16_t  dig_P4;
+    int16_t  dig_P5;
+    int16_t  dig_P6;
+    int16_t  dig_P7;
+    int16_t  dig_P8;
+    int16_t  dig_P9;
+    uint8_t  dig_H1;
+    int16_t  dig_H2;
+    uint8_t  dig_H3;
+    int16_t  dig_H4;
+    int16_t  dig_H5;
+    int8_t   dig_H6;
+} bme280_calib_data_t;
 
-static void pid_init(pid_t *p, float kp, float ki, float kd, float dt, float out_min, float out_max)
+static bme280_calib_data_t calib;
+static int32_t t_fine;
+static spi_device_handle_t bme280_spi = NULL;
+
+/* --- BME280 SPI helpers --- */
+static esp_err_t bme280_write_reg(uint8_t reg, uint8_t val)
 {
-    p->kp = kp; p->ki = ki; p->kd = kd; p->dt = dt;
-    p->integral = 0.0f;
-    p->out_min = out_min; p->out_max = out_max;
-    p->integral_min = (ki > 0.0f) ? out_min / ki : 0.0f;
-    p->integral_max = (ki > 0.0f) ? out_max / ki : 0.0f;
-    p->prev_error = 0.0f;
-    p->d_filtered = 0.0f;
-    p->d_alpha = PID_D_ALPHA;
-    p->enable_i = true;
-    p->enable_d = (kd > 0.0f);
-}
-
-static float pid_compute(pid_t *p, float setpoint, float measurement)
-{
-    float error = setpoint - measurement;
-
-    float p_term = p->kp * error;
-
-    float i_term = 0.0f;
-    if (p->enable_i) {
-        p->integral += error * p->dt;
-        if (p->integral > p->integral_max) p->integral = p->integral_max;
-        if (p->integral < p->integral_min) p->integral = p->integral_min;
-        i_term = p->ki * p->integral;
-    }
-
-    float d_term = 0.0f;
-    if (p->enable_d) {
-        float d_raw = (error - p->prev_error) / p->dt;
-        p->d_filtered = p->d_alpha * p->d_filtered + (1.0f - p->d_alpha) * d_raw;
-        d_term = p->kd * p->d_filtered;
-    }
-
-    p->prev_error = error;
-
-    float out = p_term + i_term + d_term;
-    if (out > p->out_max) out = p->out_max;
-    if (out < p->out_min) out = p->out_min;
-    return out;
-}
-
-static void pid_reset(pid_t *p)
-{
-    p->integral   = 0.0f;
-    p->d_filtered = 0.0f;
-}
-
-static int mv_dark = MV_DARK_REF;
-static int mv_full = MV_FULL_REF;
-static int mv_span = MV_FULL_REF - MV_DARK_REF;
-
-static int average_mv_at_duty(uint32_t duty, int samples)
-{
-    led_set_duty(duty);
-    vTaskDelay(pdMS_TO_TICKS(CALI_SETTLE_MS));
-
-    float acc = 0.0f;
-    for (int i = 0; i < samples; i++) {
-        int mv = ldr_read_mv(NULL);
-        acc = (i == 0) ? (float)mv : (ADC_FILTER_ALPHA * mv + (1.0f - ADC_FILTER_ALPHA) * acc);
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    return (int)(acc + 0.5f);
-}
-
-static void calibrate_range(void)
-{
-#if AUTO_CALIBRATE
-    ESP_LOGI(TAG, "calibrating: LED off ...");
-    mv_dark = average_mv_at_duty(0, CALI_SAMPLES);
-
-    ESP_LOGI(TAG, "calibrating: LED 100%% ...");
-    mv_full = average_mv_at_duty(PWM_MAX_DUTY, CALI_SAMPLES);
-
-    led_set_duty(0);
-#else
-    ESP_LOGI(TAG, "using fixed reference: %d / %d mV", MV_DARK_REF, MV_FULL_REF);
-#endif
-
-    mv_span = mv_full - mv_dark;
-    ESP_LOGI(TAG, "reference: dark=%d mV, full=%d mV, span=%d mV", mv_dark, mv_full, mv_span);
-
-    if (mv_span < MIN_SPAN_MV) {
-        ESP_LOGE(TAG, "span too small (<%d mV): LED light does not reach the LDR", MIN_SPAN_MV);
-        mv_full = mv_dark + MIN_SPAN_MV;
-        mv_span = MIN_SPAN_MV;
-    }
-}
-
-static int mode_index = 0;
-
-static void button_init(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = 1ULL << BUTTON_GPIO,
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
+    uint8_t tx[2] = {reg & 0x7F, val};
+    spi_transaction_t t = {
+        .length = 16,
+        .tx_buffer = tx,
     };
-    gpio_config(&io_conf);
+    return spi_device_transmit(bme280_spi, &t);
 }
 
-static bool check_button_and_advance_mode(void)
+static esp_err_t bme280_read_regs(uint8_t reg, uint8_t *buf, size_t len)
 {
-    static bool prev_pressed = false;
-    static int64_t last_change_us = 0;
+    /* Full-duplex: send command + dummy bytes, receive garbage + data */
+    uint8_t tx[32] = {reg | 0x80};
+    uint8_t rx[32] = {0};
+    if (len + 1 > sizeof(tx)) return ESP_ERR_INVALID_SIZE;
 
-    bool pressed = (gpio_get_level(BUTTON_GPIO) == 0);
-    int64_t now_us = esp_timer_get_time();
-
-    bool changed = false;
-    if (pressed && !prev_pressed && (now_us - last_change_us > 50000)) {
-        mode_index = (mode_index + 1) % MODE_COUNT;
-        last_change_us = now_us;
-        changed = true;
-        ESP_LOGI(TAG, "mode -> %d%%", MODE_PERCENT[mode_index]);
+    spi_transaction_t t = {
+        .length = (len + 1) * 8,
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+    esp_err_t err = spi_device_transmit(bme280_spi, &t);
+    if (err == ESP_OK) {
+        memcpy(buf, &rx[1], len);
     }
-    prev_pressed = pressed;
-    return changed;
+    return err;
 }
 
-static int mode_target_mv(void)
+static esp_err_t bme280_read_calib(void)
 {
-    return mv_dark + (int)((float)mv_span * (float)MODE_PERCENT[mode_index] / 100.0f + 0.5f);
+    uint8_t buf[26];
+    esp_err_t err = bme280_read_regs(BME280_REG_CALIB_00, buf, 26);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "calib read 0x88 failed");
+        return err;
+    }
+
+    calib.dig_T1 = (buf[1] << 8) | buf[0];
+    calib.dig_T2 = (buf[3] << 8) | buf[2];
+    calib.dig_T3 = (buf[5] << 8) | buf[4];
+    calib.dig_P1 = (buf[7] << 8) | buf[6];
+    calib.dig_P2 = (buf[9] << 8) | buf[8];
+    calib.dig_P3 = (buf[11] << 8) | buf[10];
+    calib.dig_P4 = (buf[13] << 8) | buf[12];
+    calib.dig_P5 = (buf[15] << 8) | buf[14];
+    calib.dig_P6 = (buf[17] << 8) | buf[16];
+    calib.dig_P7 = (buf[19] << 8) | buf[18];
+    calib.dig_P8 = (buf[21] << 8) | buf[20];
+    calib.dig_P9 = (buf[23] << 8) | buf[22];
+    calib.dig_H1 = buf[25];
+
+    uint8_t buf2[7];
+    err = bme280_read_regs(BME280_REG_CALIB_26, buf2, 7);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "calib read 0xE1 failed");
+        return err;
+    }
+    calib.dig_H2 = (buf2[1] << 8) | buf2[0];
+    calib.dig_H3 = buf2[2];
+    calib.dig_H4 = ((int16_t)buf2[3] << 4) | (buf2[4] & 0x0F);
+    calib.dig_H5 = ((int16_t)buf2[5] << 4) | ((buf2[4] >> 4) & 0x0F);
+    calib.dig_H6 = (int8_t)buf2[6];
+
+    return ESP_OK;
 }
 
-static TaskHandle_t pid_task_handle = NULL;
-
-static bool IRAM_ATTR timer_alarm_cb(gptimer_handle_t timer,
-                                     const gptimer_alarm_event_data_t *edata,
-                                     void *user_ctx)
+/* Bosch integer compensation formulas */
+static int32_t bme280_compensate_temp(int32_t adc_T)
 {
-    BaseType_t high_task_wakeup = pdFALSE;
-    vTaskNotifyGiveFromISR(pid_task_handle, &high_task_wakeup);
-    return high_task_wakeup == pdTRUE;
+    int32_t var1 = ((((adc_T >> 3) - ((int32_t)calib.dig_T1 << 1))) * ((int32_t)calib.dig_T2)) >> 11;
+    int32_t var2 = (((((adc_T >> 4) - ((int32_t)calib.dig_T1)) *
+                      ((adc_T >> 4) - ((int32_t)calib.dig_T1))) >> 12) *
+                    ((int32_t)calib.dig_T3)) >> 14;
+    t_fine = var1 + var2;
+    return (t_fine * 5 + 128) >> 8;
 }
 
-static void pid_timer_init(void)
+static uint32_t bme280_compensate_press(int32_t adc_P)
 {
-    gptimer_handle_t gptimer = NULL;
-    gptimer_config_t timer_config = {
-        .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
-        .direction     = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,
+    int64_t var1, var2, p;
+    var1 = (int64_t)t_fine - 128000;
+    var2 = var1 * var1 * (int64_t)calib.dig_P6;
+    var2 = var2 + ((var1 * (int64_t)calib.dig_P5) << 17);
+    var2 = var2 + (((int64_t)calib.dig_P4) << 35);
+    var1 = ((var1 * var1 * (int64_t)calib.dig_P3) >> 8) +
+           ((var1 * (int64_t)calib.dig_P2) << 12);
+    var1 = (((((int64_t)1) << 47) + var1)) * ((int64_t)calib.dig_P1) >> 33;
+    if (var1 == 0) return 0;
+    p = 1048576 - adc_P;
+    p = (((p << 31) - var2) * 3125) / var1;
+    var1 = (((int64_t)calib.dig_P9) * (p >> 13) * (p >> 13)) >> 25;
+    var2 = (((int64_t)calib.dig_P8) * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + (((int64_t)calib.dig_P7) << 4);
+    return (uint32_t)p;
+}
+
+static uint32_t bme280_compensate_hum(int32_t adc_H)
+{
+    int32_t v_x1_u32r = (t_fine - ((int32_t)76800));
+    v_x1_u32r = (((((adc_H << 14) - (((int32_t)calib.dig_H4) << 20) -
+                    (((int32_t)calib.dig_H5) * v_x1_u32r)) + ((int32_t)16384)) >> 15) *
+                 (((((((v_x1_u32r * ((int32_t)calib.dig_H6)) >> 10) *
+                     (((v_x1_u32r * ((int32_t)calib.dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
+                    ((int32_t)2097152)) * ((int32_t)calib.dig_H2) + 8192) >> 14));
+    v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) *
+                               ((int32_t)calib.dig_H1)) >> 4));
+    v_x1_u32r = (v_x1_u32r < 0 ? 0 : v_x1_u32r);
+    v_x1_u32r = (v_x1_u32r > 419430400 ? 419430400 : v_x1_u32r);
+    return (uint32_t)(v_x1_u32r >> 12);
+}
+
+static esp_err_t bme280_init(void)
+{
+    spi_bus_config_t bus_cfg = {
+        .miso_io_num = BME280_MISO,
+        .mosi_io_num = BME280_MOSI,
+        .sclk_io_num = BME280_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 32,
     };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &gptimer));
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
 
-    gptimer_event_callbacks_t cbs = { .on_alarm = timer_alarm_cb };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(gptimer));
-
-    gptimer_alarm_config_t alarm_config = {
-        .alarm_count = PID_PERIOD_US,
-        .reload_count = 0,
-        .flags.auto_reload_on_alarm = true,
+    spi_device_interface_config_t dev_cfg = {
+        .clock_speed_hz = 500000,
+        .mode = 0,  /* CPOL=0, CPHA=0 */
+        .spics_io_num = BME280_CS,
+        .queue_size = 1,
     };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
-    ESP_ERROR_CHECK(gptimer_start(gptimer));
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &bme280_spi));
+
+    uint8_t chip_id = 0;
+    ESP_ERROR_CHECK(bme280_read_regs(BME280_REG_CHIP_ID, &chip_id, 1));
+    if (chip_id != BME280_CHIP_ID) {
+        ESP_LOGE(TAG, "BME280 not found! Chip ID: 0x%02X (expected 0x%02X)", chip_id, BME280_CHIP_ID);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "BME280 found, chip ID: 0x%02X", chip_id);
+
+    ESP_ERROR_CHECK(bme280_read_calib());
+
+    /* Soft reset */
+    bme280_write_reg(BME280_REG_RESET, 0xB6);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Humidity oversampling x1 */
+    bme280_write_reg(BME280_REG_CTRL_HUM, 0x01);
+    /* Standby 0.5 ms, no filter */
+    bme280_write_reg(BME280_REG_CONFIG, 0x00);
+    /* Temp x1, Press x1, Forced mode */
+    bme280_write_reg(BME280_REG_CTRL_MEAS, 0x25);
+
+    ESP_LOGI(TAG, "BME280 initialized (SPI)");
+    return ESP_OK;
 }
 
+static esp_err_t bme280_read(float *temp, float *press, float *hum)
+{
+    /* Trigger forced measurement */
+    esp_err_t err = bme280_write_reg(BME280_REG_CTRL_MEAS, 0x25);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "trigger failed");
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(15));  /* conversion time */
+
+    uint8_t data[8];
+    err = bme280_read_regs(BME280_REG_DATA, data, 8);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "data read failed");
+        return err;
+    }
+
+    int32_t adc_P = ((int32_t)data[0] << 12) | ((int32_t)data[1] << 4) | ((int32_t)data[2] >> 4);
+    int32_t adc_T = ((int32_t)data[3] << 12) | ((int32_t)data[4] << 4) | ((int32_t)data[5] >> 4);
+    int32_t adc_H = ((int32_t)data[6] << 8) | (int32_t)data[7];
+
+    int32_t temp_raw = bme280_compensate_temp(adc_T);
+    *temp = (float)temp_raw / 100.0f;
+
+    uint32_t press_raw = bme280_compensate_press(adc_P);
+    *press = (float)press_raw / 25600.0f;  /* Pa -> hPa */
+
+    uint32_t hum_raw = bme280_compensate_hum(adc_H);
+    *hum = (float)hum_raw / 1024.0f;
+
+    return ESP_OK;
+}
+
+/* -------------------- WiFi -------------------- */
+static EventGroupHandle_t wifi_event_group;
+#define WIFI_CONNECTED_BIT  BIT0
+#define WIFI_FAIL_BIT         BIT1
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        static int retry = 0;
+        if (retry < 5) {
+            esp_wifi_connect();
+            retry++;
+            ESP_LOGI(TAG, "WiFi retry %d/5", retry);
+        } else {
+            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static void wifi_init(void)
+{
+    wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler, NULL, &instance_got_ip));
+
+    wifi_config_t wifi_config = {0};
+    strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi init finished, waiting for connection...");
+
+    EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE, portMAX_DELAY);
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Connected to AP SSID:%s", WIFI_SSID);
+    } else {
+        ESP_LOGE(TAG, "Failed to connect to SSID:%s", WIFI_SSID);
+    }
+}
+
+/* -------------------- MQTT -------------------- */
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+static EventGroupHandle_t mqtt_event_group;
+#define MQTT_CONNECTED_BIT  BIT0
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI(TAG, "MQTT connected");
+        xEventGroupSetBits(mqtt_event_group, MQTT_CONNECTED_BIT);
+
+        /* Subscribe to the same topics for loopback testing */
+        esp_mqtt_client_subscribe(mqtt_client, TOPIC_TEMP, 0);
+        esp_mqtt_client_subscribe(mqtt_client, TOPIC_HUM, 0);
+        esp_mqtt_client_subscribe(mqtt_client, TOPIC_PRES, 0);
+        ESP_LOGI(TAG, "Subscribed to %s, %s, %s", TOPIC_TEMP, TOPIC_HUM, TOPIC_PRES);
+        break;
+
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "MQTT disconnected");
+        xEventGroupClearBits(mqtt_event_group, MQTT_CONNECTED_BIT);
+        break;
+
+    case MQTT_EVENT_DATA: {
+        char topic[64] = {0};
+        char data[64] = {0};
+        int tlen = event->topic_len < sizeof(topic) - 1 ? event->topic_len : sizeof(topic) - 1;
+        int dlen = event->data_len < sizeof(data) - 1 ? event->data_len : sizeof(data) - 1;
+        memcpy(topic, event->topic, tlen);
+        memcpy(data, event->data, dlen);
+        ESP_LOGI(TAG, "RX [%s] -> %s", topic, data);
+        break;
+    }
+
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(TAG, "MQTT error");
+        break;
+
+    default:
+        break;
+    }
+}
+
+static void mqtt_init(void)
+{
+    mqtt_event_group = xEventGroupCreate();
+
+    char uri[80];
+    snprintf(uri, sizeof(uri), "mqtt://%s:%d", MQTT_BROKER_IP, MQTT_BROKER_PORT);
+    ESP_LOGI(TAG, "MQTT broker URI: %s", uri);
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = uri,
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID,
+                                                    mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(mqtt_client));
+
+    xEventGroupWaitBits(mqtt_event_group, MQTT_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+}
+
+/* -------------------- Main -------------------- */
 void app_main(void)
 {
-    pid_task_handle = xTaskGetCurrentTaskHandle();
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
-    led_pwm_init();
-    ldr_adc_init();
-    button_init();
+    ESP_LOGI(TAG, "=== BME280 MQTT project starting ===");
 
-    calibrate_range();
-    pid_timer_init();
+    wifi_init();
+    mqtt_init();
 
-    pid_t light_pid;
-    pid_init(&light_pid, PID_KP, PID_KI, PID_KD, PID_DT_S,
-             0.0f, (float)PWM_MAX_DUTY);
-
-    float filt_mv = 0.0f;
-    bool  filt_init = false;
-    int   target_mv = mode_target_mv();
-
-    ESP_LOGI(TAG, "mode %d%% -> target %d mV (span %d mV)",
-             MODE_PERCENT[mode_index], target_mv, mv_span);
-    pid_reset(&light_pid);
+    if (bme280_init() != ESP_OK) {
+        ESP_LOGE(TAG, "BME280 init failed, halting");
+        vTaskDelay(portMAX_DELAY);
+    }
 
     while (1) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        float temp, press, hum;
+        if (bme280_read(&temp, &press, &hum) == ESP_OK) {
+            /* Full format: T21.2  P762  H60% */
+            char env_str[64];
+            snprintf(env_str, sizeof(env_str), "T%.1f  P%.0f  H%.0f%%", temp, press, hum);
+            ESP_LOGI(TAG, "%s", env_str);
 
-        if (check_button_and_advance_mode()) {
-            target_mv = mode_target_mv();
-            pid_reset(&light_pid);
+            char val[16];
+
+            /* Publish individual values to their topics */
+            snprintf(val, sizeof(val), "T%.1f", temp);
+            esp_mqtt_client_publish(mqtt_client, TOPIC_TEMP, val, 0, 0, 0);
+
+            snprintf(val, sizeof(val), "H%.0f%%", hum);
+            esp_mqtt_client_publish(mqtt_client, TOPIC_HUM, val, 0, 0, 0);
+
+            snprintf(val, sizeof(val), "P%.0f", press);
+            esp_mqtt_client_publish(mqtt_client, TOPIC_PRES, val, 0, 0, 0);
+
+            /* Also publish the full formatted snapshot string */
+            esp_mqtt_client_publish(mqtt_client, TOPIC_ENV, env_str, 0, 0, 0);
+        } else {
+            ESP_LOGE(TAG, "BME280 read failed");
         }
 
-        int raw = 0;
-        int mv  = ldr_read_mv(&raw);
-
-        filt_mv = filt_init ? (ADC_FILTER_ALPHA * mv + (1.0f - ADC_FILTER_ALPHA) * filt_mv)
-                            : (float)mv;
-        filt_init = true;
-
-        float pv_norm     = (filt_mv - (float)mv_dark) / (float)mv_span;
-        float target_norm = (float)(target_mv - mv_dark) / (float)mv_span;
-
-        float output = pid_compute(&light_pid, target_norm, pv_norm);
-        led_set_duty((uint32_t)output);
-
-        printf("t_ms:%lld|mode:%d|target_mv:%d|pv_mv:%d|error_mV:%d|duty:%d\n",
-               (long long)(esp_timer_get_time() / 1000),
-               MODE_PERCENT[mode_index], target_mv, (int)filt_mv,
-               target_mv - (int)filt_mv, (int)output);
+        vTaskDelay(pdMS_TO_TICKS(500));  /* 2 times per second */
     }
 }
