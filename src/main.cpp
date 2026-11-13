@@ -1,54 +1,45 @@
-#include <FreeRTOS.h>
-#include <task.h>
+#include <Arduino.h>
 
-#include <driver/gpio.h>
-#include <esp_log.h>
+enum class LedState : uint8_t { Off, On };
 
-// GPIO_NUM_* instead of plain ints: the gpio_* API takes gpio_num_t.
-#define YELLOW_LED_PIN GPIO_NUM_2
-#define RED_LED_PIN GPIO_NUM_35
-#define BLUE_LED_PIN GPIO_NUM_38
-
-static const char *TAG = "blink";
-
-struct Led {
-  gpio_num_t pin;
-  uint32_t periodMs; // ms between toggles
+// Only compile-time values here: no magic numbers in the code below.
+struct BlinkConfig {
+  static constexpr uint8_t kLedPin = 2;           // single LED
+  static constexpr uint32_t kBlinkPeriodMs = 500; // ms between state changes
+  static constexpr LedState kInitialState = LedState::Off;
 };
 
-static const Led leds[] = {
-    {YELLOW_LED_PIN, 500},
-    {RED_LED_PIN, 200},
-    {BLUE_LED_PIN, 1000},
+class Led {
+public:
+  explicit Led(uint8_t pin) : pin_(pin), state_(BlinkConfig::kInitialState) {}
+
+  void init() {
+    pinMode(pin_, OUTPUT);
+    set(BlinkConfig::kInitialState);
+  }
+
+  void set(LedState state) {
+    state_ = state;
+    digitalWrite(pin_, state == LedState::On ? HIGH : LOW);
+  }
+
+  void toggle() { set(state_ == LedState::On ? LedState::Off : LedState::On); }
+
+private:
+  uint8_t pin_;
+  LedState state_;
 };
 
-static void blinkTask(void *arg) {
-  const Led *led = static_cast<const Led *>(arg);
-  bool on = false;
-  while (1) {
-    on = !on;
-    gpio_set_level(led->pin, on);
-    vTaskDelay(pdMS_TO_TICKS(led->periodMs));
-  }
-}
+// Minimal file-scope state: Arduino gives setup()/loop() no owner for it.
+static Led led(BlinkConfig::kLedPin);
+static uint32_t lastBlinkMs = 0;
 
-void setup() {
-  for (const Led &led : leds) {
-    gpio_set_direction(led.pin, GPIO_MODE_OUTPUT);
-    gpio_set_level(led.pin, 0);
-  }
-
-  for (const Led &led : leds) {
-    char name[16];
-    snprintf(name, sizeof(name), "blink%d", led.pin);
-    if (xTaskCreatePinnedToCore(blinkTask, name, 4096, (void *)&led, 1, nullptr,
-                                0) != pdPASS) {
-      ESP_LOGE(TAG, "failed to create task for pin %d", led.pin);
-    }
-  }
-}
+void setup() { led.init(); }
 
 void loop() {
-  // All work runs in the blink tasks; do not busy-spin here.
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  const uint32_t now = millis();
+  if (now - lastBlinkMs >= BlinkConfig::kBlinkPeriodMs) {
+    lastBlinkMs = now;
+    led.toggle();
+  }
 }
