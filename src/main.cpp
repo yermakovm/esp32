@@ -3,8 +3,8 @@
 // Homework 2.2 — measure the mechanical delay of a relay.
 //
 // Wiring (board = esp32-s3-devkitc-1):
-//   GPIO26 -> relay module IN / transistor base (via resistor) : drives the coil
-//   GPIO27 -> relay "dry" NO (normally-open) contact; other contact leg -> GND
+//   GPIO2  -> relay module IN / transistor base (via resistor) : drives the coil
+//   GPIO4  -> relay "dry" NO (normally-open) contact; other contact leg -> GND
 //             INPUT_PULLUP provides the pull-up: HIGH = contact open, LOW = closed
 //   5V + GND from the board to the relay module.
 //
@@ -13,8 +13,8 @@
 // the real make/break. Everything that follows within the settle window is
 // contact bounce: it is counted and reported, but never used as the delay.
 
-static constexpr uint8_t kRelayPin = 26;   // coil drive
-static constexpr uint8_t kContactPin = 27; // dry contact, INPUT_PULLUP
+static constexpr uint8_t kRelayPin = 2;   // coil drive
+static constexpr uint8_t kContactPin = 4; // dry contact, INPUT_PULLUP
 
 static constexpr uint8_t kSamples = 12;    // >= 10 as required
 static constexpr uint32_t kHoldUs = 60000;  // how long the coil stays in each state
